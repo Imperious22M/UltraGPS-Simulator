@@ -46,6 +46,7 @@ To pick up library changes, copy that folder over again.
 | Bad values | Chance a reading is a random wrong range (multipath, EMI) |
 | Air temp | Speed-of-sound change against the 20 °C calibration |
 | Speed | How fast the transmitter moves |
+| **Reject dist ≤ 0** | Off by default (matches the control system). On, it also drops receivers whose distance is zero or negative — see below |
 
 The panel on the right shows each algorithm's current and RMS error against the
 true position, how many frames it failed, which receivers the library's filter
@@ -85,6 +86,23 @@ because the simulator calls `get_position_full()` exactly as UltraGPS-Control's
 
   With fewer than 4 kept receivers it holds its last fix, and with exactly 4
   kept it has no subset to choose, so a bad reading among those 4 gets through.
+
+## Dead receivers and the "Reject dist ≤ 0" toggle
+
+A receiver that is off, misses its echo, or is out of range reports 0 ticks,
+which calibrates to its intercept, a negative distance (R5: −150.5 cm). The
+library's bounds check only rejects distances that are too long, and the jump
+filter only rejects the frame where the value changes, so from the second
+frame on the dead receiver is kept. LM and OLS then go badly wrong (R5 off at
+(30, 50): LM about 92 cm off).
+
+Ticking **Reject dist ≤ 0** applies `SimPositionLib`, a subclass of the library
+in `solvers.py` that also drops kept receivers with a distance ≤ 0. The
+equivalent one-line change in the library's `_filter_receivers` would be:
+
+```python
+within_bounds = (arr > 0) & (arr <= self._max_receiver_dist)
+```
 
 ## Sensor model
 
