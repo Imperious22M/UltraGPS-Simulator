@@ -58,6 +58,16 @@ class SimulatorTest(unittest.TestCase):
         # 6 receivers: C(6,3) + C(6,4) + C(6,5) + C(6,6) = 20 + 15 + 6 + 1
         self.assertEqual(len(set(calls)), 42)
 
+    def test_cep_reports_no_subset_when_holding_last_fix(self):
+        sim = Simulation(seed=0)
+        good = run(sim, [30, 50], frames=5)
+        for i in (1, 2, 3, 4):
+            sim.enabled[i] = False
+        held = sim.step()
+        self.assertFalse(held["success"]["CEP"])
+        self.assertEqual(held["cep_subset"], [])
+        np.testing.assert_array_equal(held["positions"]["CEP"], good["positions"]["CEP"])
+
 
 if __name__ == "__main__":
     unittest.main()

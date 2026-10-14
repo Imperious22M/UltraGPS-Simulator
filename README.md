@@ -50,6 +50,8 @@ To pick up library changes, copy that folder over again.
 The panel on the right shows each algorithm's current and RMS error against the
 true position, how many frames it failed, which receivers the library's filter
 kept, which subset CEP picked, and the raw ticks and distances per receiver.
+When fewer than 3 receivers are kept, no solver runs: LM and CEP hold their
+last good fix, the frame counts as a failure, and CEP shows no subset.
 
 On the arena, each receiver's colour shows what its sensor did this frame
 (green ok, grey off, orange missed or out of range, red bad value), a thick

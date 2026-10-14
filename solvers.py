@@ -71,5 +71,8 @@ class Solvers:
             "success":    {"OLS": ols is not None, "LM": r["lm_success"], "CEP": r["cep_success"]},
             "distances":  list(r["distances"]),
             "sane":       list(sane),
-            "cep_subset": list(r["best_indices"] or []),
+            # On a failed frame the library returns the last good fix and the
+            # subset that produced it; report no subset so it is not mistaken
+            # for one used this frame.
+            "cep_subset": list(r["best_indices"] or []) if r["cep_success"] else [],
         }

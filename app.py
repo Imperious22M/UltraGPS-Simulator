@@ -182,7 +182,7 @@ class App:
             "",
             f"frames     {self.sim.frames}",
             f"kept       {', '.join(f'R{i}' for i in f['sane']) or 'none'}",
-            f"CEP used   {', '.join(f'R{i}' for i in f['cep_subset']) or 'none'}",
+            f"CEP used   {', '.join(f'R{i}' for i in f['cep_subset']) or 'none, holding last fix'}",
             "",
             "rx  status   ticks   dist(cm)",
         ]
