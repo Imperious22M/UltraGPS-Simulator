@@ -65,8 +65,11 @@ because the simulator calls `get_position_full()` exactly as UltraGPS-Control's
 - **OLS** — linear least squares on the squared-range differences. This is the
   seed both other solvers start from.
 - **LM** — the OLS seed refined by Levenberg-Marquardt over all kept receivers.
-- **CEP** — tries receiver subsets and keeps the one with the smallest Circular
-  Error Probable, falling back to the last good fix when out of bounds.
+- **CEP** — tries every subset of 3 or more kept receivers (42 subsets with
+  all six) and keeps the one with the smallest Circular Error Probable,
+  falling back to the last good fix when out of bounds. The library's own
+  default stops after 15 subsets; the simulator raises that cap through the
+  library's `max_subsets` argument, so the library code itself is unchanged.
 
 ## Sensor model
 

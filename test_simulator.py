@@ -49,6 +49,15 @@ class SimulatorTest(unittest.TestCase):
         self.assertNotIn(0, frame["cep_subset"])
         self.assertLess(sim.stats("CEP")[0], 5.0)
 
+    def test_cep_tries_every_subset_of_three_or_more(self):
+        sim = Simulation(seed=0)
+        calls = []
+        real = sim.solvers.lib._compute_cep
+        sim.solvers.lib._compute_cep = lambda d, idx: calls.append(tuple(idx)) or real(d, idx)
+        run(sim, [30, 50], frames=1)
+        # 6 receivers: C(6,3) + C(6,4) + C(6,5) + C(6,6) = 20 + 15 + 6 + 1
+        self.assertEqual(len(set(calls)), 42)
+
 
 if __name__ == "__main__":
     unittest.main()
