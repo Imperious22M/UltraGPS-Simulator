@@ -17,7 +17,20 @@ Algorithms shown:
                subsets that exist, so every subset of 3 or more kept
                receivers is tried and the lowest-CEP one wins.
 
-All three see the same receivers: the ones that pass the library's bounds and
+  * ``CEP4`` — simulator-only variant of CEP for comparison.  It differs
+               from the library's CEP in three ways:
+                 - only subsets of 4 or more receivers are tried, so one bad
+                   reading can't hide inside an exact 3-receiver fit;
+                 - fixes outside the receivers' bounding box are kept;
+                 - CEP is the textbook one: covariance = s² (JᵀJ)⁻¹ with
+                   s² = sum of squared residuals / (m − 2).  The library
+                   instead weights each receiver by 1 / (|residual| + 0.1),
+                   which rewards a fit where some residuals are near zero
+                   and lets a bad reading win.
+               Each subset is solved with the library's own OLS + LM.  With
+               fewer than 4 kept receivers it holds its last fix.
+
+All four see the same receivers: the ones that pass the library's bounds and
 jump (differential) filter, run once per frame by ``get_position_full`` —
 exactly as UltraGPS-Control's ``windows/position_window.py`` calls it.
 """
@@ -25,6 +38,7 @@ exactly as UltraGPS-Control's ``windows/position_window.py`` calls it.
 from __future__ import annotations
 
 import os
+from itertools import combinations
 from math import comb
 
 import numpy as np
@@ -34,7 +48,7 @@ from ultragps_position import UltraGPSPositionLib, load_config
 _REPO = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CONFIG = os.path.join(_REPO, "config", "config.toml")
-ALGORITHMS     = ("OLS", "LM", "CEP")
+ALGORITHMS     = ("OLS", "LM", "CEP", "CEP4")
 
 
 def load_calibration(config_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -52,9 +66,37 @@ class Solvers:
         # Subsets of size 3..n of n receivers, plus one: every subset is tried
         n = self.lib.receiver_count
         self.max_subsets = 2 ** n - sum(comb(n, k) for k in range(3)) + 1
+        self.cep4_last = None
 
     def reset(self) -> None:
         self.lib.reset_state()
+        self.cep4_last = None
+
+    def _standard_cep(self, distances, subset) -> tuple:
+        d      = np.array(distances, dtype=float)
+        idx    = np.array(subset)
+        pos, r = self.lib._nlls(d, self.lib._ols(d, idx), idx)
+        J      = r.jac
+        s2     = float(np.sum(r.fun ** 2)) / (len(subset) - 2)
+        try:
+            cov = s2 * np.linalg.inv(J.T @ J)
+        except np.linalg.LinAlgError:
+            return pos, float("inf")
+        return pos, 0.59 * (np.sqrt(abs(cov[0, 0])) + np.sqrt(abs(cov[1, 1])))
+
+    def cep4(self, distances, sane) -> tuple:
+        """Lowest-CEP subset of 4+ kept receivers, no bounding-box check.
+        Returns ``(position, subset)``; subset is ``[]`` when holding."""
+        best_pos, best_cep, best_idx = None, float("inf"), []
+        for k in range(4, len(sane) + 1):
+            for subset in combinations(sane, k):
+                pos, cep = self._standard_cep(distances, list(subset))
+                if cep < best_cep:
+                    best_pos, best_cep, best_idx = pos, cep, list(subset)
+        if best_pos is None:
+            return self.cep4_last, []
+        self.cep4_last = np.asarray(best_pos, dtype=float).copy()
+        return self.cep4_last, best_idx
 
     def solve(self, ticks: list[int]) -> dict:
         """Return ``{"positions": {name: xy or None}, "success": {name: bool},
@@ -66,13 +108,18 @@ class Solvers:
         if len(sane) >= 3:
             ols = self.lib._ols(np.array(r["distances"], dtype=float), np.array(sane))
 
+        cep4_pos, cep4_subset = self.cep4(r["distances"], list(sane))
+
         return {
-            "positions":  {"OLS": ols, "LM": r["lm_position"], "CEP": r["cep_position"]},
-            "success":    {"OLS": ols is not None, "LM": r["lm_success"], "CEP": r["cep_success"]},
+            "positions":  {"OLS": ols, "LM": r["lm_position"], "CEP": r["cep_position"],
+                           "CEP4": cep4_pos},
+            "success":    {"OLS": ols is not None, "LM": r["lm_success"], "CEP": r["cep_success"],
+                           "CEP4": bool(cep4_subset)},
             "distances":  list(r["distances"]),
             "sane":       list(sane),
             # On a failed frame the library returns the last good fix and the
             # subset that produced it; report no subset so it is not mistaken
             # for one used this frame.
-            "cep_subset": list(r["best_indices"] or []) if r["cep_success"] else [],
+            "cep_subset":  list(r["best_indices"] or []) if r["cep_success"] else [],
+            "cep4_subset": cep4_subset,
         }

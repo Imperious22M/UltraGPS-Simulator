@@ -60,7 +60,7 @@ solid if the library kept that reading, dotted red if its filter dropped it.
 
 ## Algorithms shown
 
-All three come from `ultragps_position` and see the same filtered receivers,
+OLS, LM and CEP come from `ultragps_position`; all four see the same filtered receivers,
 because the simulator calls `get_position_full()` exactly as UltraGPS-Control's
 `windows/position_window.py` does.
 
@@ -72,6 +72,19 @@ because the simulator calls `get_position_full()` exactly as UltraGPS-Control's
   falling back to the last good fix when out of bounds. The library's own
   default stops after 15 subsets; the simulator raises that cap through the
   library's `max_subsets` argument, so the library code itself is unchanged.
+- **CEP4** — a simulator-only variant for comparison; it is not in the
+  library. Each subset is still solved with the library's OLS + LM, but:
+  - only subsets of **4 or more** receivers are tried, so a bad reading can't
+    hide inside a 3-receiver fit (three ranges almost always fit a 2D point);
+  - fixes **outside the receivers' bounding box are kept** instead of being
+    replaced by the last good fix;
+  - the score is the textbook CEP, `0.59·(σx + σy)` from
+    `s²·(JᵀJ)⁻¹` with `s² = Σresidual² / (m − 2)`. The library weights each
+    receiver by `1 / (|residual| + 0.1)`, which rewards fits where some
+    residuals are near zero.
+
+  With fewer than 4 kept receivers it holds its last fix, and with exactly 4
+  kept it has no subset to choose, so a bad reading among those 4 gets through.
 
 ## Sensor model
 

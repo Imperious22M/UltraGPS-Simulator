@@ -22,8 +22,9 @@ from simulation import Simulation
 from solvers import ALGORITHMS, DEFAULT_CONFIG
 
 DT          = 0.1   # s per frame — the base station's default 10 Hz
-COLORS      = {"OLS": "tab:orange", "LM": "tab:blue", "CEP": "tab:green"}
-LABELS      = {"OLS": "Linear LS (OLS)", "LM": "OLS + Levenberg-Marquardt", "CEP": "CEP best subset"}
+COLORS      = {"OLS": "tab:orange", "LM": "tab:blue", "CEP": "tab:green", "CEP4": "tab:purple"}
+LABELS      = {"OLS": "Linear LS (OLS)", "LM": "OLS + Levenberg-Marquardt", "CEP": "CEP best subset",
+               "CEP4": "CEP, 4+ receivers, no box"}
 STATUS_FILL = {"ok": "tab:green", "off": "lightgray", "dropout": "tab:orange",
                "range": "tab:orange", "spike": "tab:red"}
 PATH_RADIUS = 100.0
@@ -83,7 +84,7 @@ class App:
         self.tower_cb.on_clicked(self._on_tower)
 
         f.text(0.80, 0.95, "Algorithms", weight="bold")
-        self.algo_cb = CheckButtons(f.add_axes([0.80, 0.80, 0.18, 0.14]),
+        self.algo_cb = CheckButtons(f.add_axes([0.80, 0.76, 0.18, 0.18]),
                                     list(ALGORITHMS), [True] * len(ALGORITHMS))
         self.algo_cb.on_clicked(self._on_algo)
 
@@ -183,6 +184,7 @@ class App:
             f"frames     {self.sim.frames}",
             f"kept       {', '.join(f'R{i}' for i in f['sane']) or 'none'}",
             f"CEP used   {', '.join(f'R{i}' for i in f['cep_subset']) or 'none, holding last fix'}",
+            f"CEP4 used  {', '.join(f'R{i}' for i in f['cep4_subset']) or 'none, holding last fix'}",
             "",
             "rx  status   ticks   dist(cm)",
         ]

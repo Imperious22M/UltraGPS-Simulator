@@ -32,7 +32,7 @@ class SimulatorTest(unittest.TestCase):
         sim = Simulation(seed=0)
         sim.faults = Faults(noise_cm=0.0)
         run(sim, [30, 50])
-        for a in ("OLS", "LM", "CEP"):
+        for a in ("OLS", "LM", "CEP", "CEP4"):
             self.assertLess(sim.stats(a)[0], 2.0, a)
 
     def test_receiver_off_reports_zero_ticks(self):
@@ -67,6 +67,22 @@ class SimulatorTest(unittest.TestCase):
         self.assertFalse(held["success"]["CEP"])
         self.assertEqual(held["cep_subset"], [])
         np.testing.assert_array_equal(held["positions"]["CEP"], good["positions"]["CEP"])
+
+    def test_cep4_uses_four_or_more_and_keeps_fixes_outside_the_box(self):
+        sim = Simulation(seed=0)
+        frame = run(sim, [140, 0])          # x beyond the receivers at ±127
+        self.assertGreaterEqual(len(frame["cep4_subset"]), 4)
+        self.assertLess(sim.stats("CEP4")[0], 5.0)
+        self.assertFalse(frame["success"]["CEP"])   # library CEP holds instead
+
+    def test_cep4_holds_with_fewer_than_four_receivers(self):
+        sim = Simulation(seed=0)
+        good = run(sim, [30, 50], frames=5)
+        for i in (1, 2, 3):
+            sim.enabled[i] = False
+        held = sim.step()
+        self.assertEqual(held["cep4_subset"], [])
+        np.testing.assert_array_equal(held["positions"]["CEP4"], good["positions"]["CEP4"])
 
 
 if __name__ == "__main__":
