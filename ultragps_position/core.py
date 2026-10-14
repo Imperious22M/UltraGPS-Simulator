@@ -498,9 +498,10 @@ class UltraGPSPositionLib:
     def _filter_receivers(self, distances: tuple) -> np.ndarray:
         """Return indices of receivers that pass both sanity checks:
 
-        1. **Bounds check** — reported distance ≤ maximum pairwise receiver
-           distance (a reading larger than this cannot be physically valid
-           within the arena).
+        1. **Bounds check** — reported distance is > 0 and ≤ maximum pairwise
+           receiver distance (a reading larger than this cannot be physically
+           valid within the arena; a dead or missed receiver reports 0 ticks,
+           which calibrates to its negative intercept).
         2. **Differential check** — absolute change from the previous reading
            is below ``max_differential`` (cm).  This check is skipped on the
            first call when no prior data exists.
@@ -508,7 +509,7 @@ class UltraGPSPositionLib:
         Updates ``_last_distances`` and ``_last_sane_indices`` in-place.
         """
         arr           = np.array(distances, dtype=float)
-        within_bounds = arr <= self._max_receiver_dist
+        within_bounds = (arr > 0) & (arr <= self._max_receiver_dist)
 
         if self._last_distances is None:
             self._last_distances    = arr.copy()

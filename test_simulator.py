@@ -84,17 +84,14 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(held["cep4_subset"], [])
         np.testing.assert_array_equal(held["positions"]["CEP4"], good["positions"]["CEP4"])
 
-    def test_dead_receiver_is_kept_unless_nonpositive_filter_is_on(self):
-        for reject, expect_kept in ((False, True), (True, False)):
-            sim = Simulation(seed=0)
-            sim.solvers.lib.reject_nonpositive = reject
-            run(sim, [30, 50], frames=5)
-            sim.enabled[5] = False
-            for _ in range(3):
-                frame = sim.step()
-            self.assertEqual(5 in frame["sane"], expect_kept)
-            if reject:
-                self.assertLess(sim.stats("LM")[0], 5.0)
+    def test_dead_receiver_is_filtered_out(self):
+        sim = Simulation(seed=0)
+        run(sim, [30, 50], frames=5)
+        sim.enabled[5] = False
+        for _ in range(3):
+            frame = sim.step()
+        self.assertNotIn(5, frame["sane"])
+        self.assertLess(sim.stats("LM")[0], 5.0)
 
 
 if __name__ == "__main__":

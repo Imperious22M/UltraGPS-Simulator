@@ -88,10 +88,6 @@ class App:
                                     list(ALGORITHMS), [True] * len(ALGORITHMS))
         self.algo_cb.on_clicked(self._on_algo)
 
-        self.fix_cb = CheckButtons(f.add_axes([0.80, 0.68, 0.18, 0.06]),
-                                   ["Reject dist ≤ 0"], [False])
-        self.fix_cb.on_clicked(self._on_fix)
-
         fl = self.sim.faults
         def slider(y, label, lo, hi, init, fmt):
             s = Slider(f.add_axes([0.72, y, 0.20, 0.025]), label, lo, hi, valinit=init, valfmt=fmt)
@@ -124,10 +120,6 @@ class App:
 
     def _on_algo(self, label) -> None:
         self.shown[label] = not self.shown[label]
-
-    def _on_fix(self, _) -> None:
-        lib = self.sim.solvers.lib
-        lib.reject_nonpositive = not lib.reject_nonpositive
 
     def _on_slider(self) -> None:
         fl = self.sim.faults

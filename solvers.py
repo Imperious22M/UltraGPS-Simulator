@@ -2,9 +2,8 @@
 Solvers — runs every positioning algorithm in the real ``ultragps_position``
 library on one frame of ticks.
 
-The library is a verbatim copy of ``libs/ultragps_position`` from
-UltraGPS-Control (see README), so the simulator exercises the same code the
-control program runs.
+The library is a copy of ``libs/ultragps_position`` from UltraGPS-Control
+with one change: its receiver filter also drops distances <= 0 (see README).
 
 Algorithms shown:
 
@@ -29,13 +28,6 @@ Algorithms shown:
                    and lets a bad reading win.
                Each subset is solved with the library's own OLS + LM.  With
                fewer than 4 kept receivers it holds its last fix.
-
-Optional fix (``reject_nonpositive``, off by default): the library's bounds
-check only rejects distances that are too long, so a dead or missed receiver
-(0 ticks -> distance = its negative calibration intercept) is kept once the
-jump filter has seen the same value twice.  When enabled, ``SimPositionLib``
-also drops kept receivers whose distance is <= 0.  It is a subclass; the
-copied library file is not edited.
 
 All four see the same receivers: the ones that pass the library's bounds and
 jump (differential) filter, run once per frame by ``get_position_full`` —
@@ -67,22 +59,9 @@ def load_calibration(config_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarr
     return coords, slopes, intercepts
 
 
-class SimPositionLib(UltraGPSPositionLib):
-    """The library, plus an optional filter for non-positive distances."""
-
-    reject_nonpositive = False
-
-    def _filter_receivers(self, distances):
-        sane = super()._filter_receivers(distances)
-        if self.reject_nonpositive:
-            sane = sane[np.array(distances, dtype=float)[sane] > 0]
-            self._last_sane_indices = sane
-        return sane
-
-
 class Solvers:
     def __init__(self, config_path: str = DEFAULT_CONFIG, max_differential: float = 50.0):
-        self.lib = SimPositionLib(config_path, max_differential=max_differential)
+        self.lib = UltraGPSPositionLib(config_path, max_differential=max_differential)
         # Subsets of size 3..n of n receivers, plus one: every subset is tried
         n = self.lib.receiver_count
         self.max_subsets = 2 ** n - sum(comb(n, k) for k in range(3)) + 1
