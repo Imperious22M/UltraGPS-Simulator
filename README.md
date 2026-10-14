@@ -14,7 +14,7 @@ Python 3.11 or later:
 ```bash
 python3 -m pip install -r requirements.txt
 python3 app.py
-python3 app.py --config path/to/config.toml --max-differential 50 --seed 1
+python3 app.py --config path/to/config.toml --max-differential 50 --max-distance 400 --seed 1
 ```
 
 It reads receiver positions and calibration from `config/config.toml`, a copy
@@ -31,11 +31,19 @@ repository at run time. Two things are copied in from
 - `ultragps_position/` — the positioning library (`libs/ultragps_position`)
 - `config/config.toml` — receiver positions and calibration (unmodified)
 
-The library copy has **one change** from that commit, in
-`_filter_receivers`: a distance must be greater than 0 to be kept.
+The library copy has **two changes** from that commit, both in the sanity
+filter `_filter_receivers`:
+
+1. A distance must be greater than 0 to be kept.
+2. The upper bound is a **top-band reject**, `max_distance`, a new optional
+   constructor argument and attribute. `None` (the default) keeps the original
+   bound, the widest receiver spacing (about 452 cm here). A receiver that
+   loses the signal can report a very high value, which this rejects.
 
 ```python
-within_bounds = (arr > 0) & (arr <= self._max_receiver_dist)   # was: arr <= ...
+# was: within_bounds = arr <= self._max_receiver_dist
+top           = self.max_distance if self.max_distance is not None else self._max_receiver_dist
+within_bounds = (arr > 0) & (arr <= top)
 ```
 
 A receiver that is off, misses its echo, or is out of range reports 0 ticks,
@@ -46,7 +54,7 @@ on a dead receiver was kept and LM and OLS went badly wrong (R5 off at
 (30, 50): LM about 92 cm off). UltraGPS-Control still has the original check.
 
 To pick up later library changes, copy the folder over again and re-apply
-that line.
+these changes (`diff` against UltraGPS-Control shows them).
 
 ## What you can do
 
@@ -58,9 +66,14 @@ that line.
 | **Algorithms** | Show or hide each solver's estimate |
 | Noise σ | Gaussian range noise in cm |
 | Dropouts | Chance a reading is missed and reported as 0 ticks |
-| Bad values | Chance a reading is a random wrong range (multipath, EMI) |
+| Lost signal | Chance the sensor loses the signal and reports a high value (its ~38 ms echo timeout, about 13 m) |
+| Bad values | Chance a reading is wrong (multipath, EMI) |
+| Bad value range | How wrong: the measured range off by a random amount within ± this % |
 | Air temp | Speed-of-sound change against the 20 °C calibration |
 | Speed | How fast the transmitter moves |
+| Top-band reject | The library filter drops any distance above this (default: widest receiver spacing) |
+| Timestep | Simulated seconds per frame, and the time between frames when running |
+| **Pause** / **Step** | Stop the run / advance exactly one frame (Step pauses first) |
 
 The panel on the right shows each algorithm's current and RMS error against the
 true position, how many frames it failed, which receivers the library's filter
@@ -105,7 +118,10 @@ because the simulator calls `get_position_full()` exactly as UltraGPS-Control's
 
 `sensor_model.py` turns a true position into ticks: straight-line range,
 speed-of-sound scaling for temperature, Gaussian noise, then the faults above.
-Ranges beyond the HC-SR04's 400 cm read as 0 ticks. Distances are converted to
+Ranges beyond the HC-SR04's 400 cm read as 0 ticks. A lost signal reads as the
+distance sound travels in the HC-SR04's ~38 ms echo timeout (datasheet value;
+the real board's figure may differ). A bad value is the measured range scaled
+by a random factor within ±"Bad value range" %. Distances are converted to
 ticks by inverting each receiver's calibration (`tick = (d - intercept) / slope`),
 so the library's own `tick * slope + intercept` recovers them.
 

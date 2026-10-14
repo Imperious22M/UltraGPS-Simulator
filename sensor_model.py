@@ -13,7 +13,11 @@ Physics, in order:
 
      * receiver switched off           -> 0 ticks (unused pins report 0)
      * echo missed / beyond max range  -> 0 ticks (no transition recorded)
-     * erroneous echo (multipath, EMI) -> a random range inside max range
+     * signal lost, sensor times out   -> a high value: the HC-SR04 holds its
+                                          echo line until its ~38 ms timeout,
+                                          i.e. about 13 m of travel
+     * erroneous echo (multipath, EMI) -> the measured range off by a random
+                                          amount within ±``spike_pct`` %
 
   5. Inverse calibration: ``tick = (distance - intercept) / slope``, rounded to
      an integer, so the library's own ``tick * slope + intercept`` recovers the
@@ -27,6 +31,9 @@ from dataclasses import dataclass
 import numpy as np
 
 
+ECHO_TIMEOUT_S = 0.038   # HC-SR04 echo timeout (datasheet: ~38 ms with no echo)
+
+
 def speed_of_sound(temp_c: float) -> float:
     """Speed of sound in dry air (m/s)."""
     return 331.3 + 0.606 * temp_c
@@ -36,7 +43,9 @@ def speed_of_sound(temp_c: float) -> float:
 class Faults:
     noise_cm: float = 1.0        # std-dev of range noise
     dropout_rate: float = 0.0    # probability a reading is missed (0 ticks)
-    spike_rate: float = 0.0      # probability a reading is a random wrong value
+    timeout_rate: float = 0.0    # probability the signal is lost (high value)
+    spike_rate: float = 0.0      # probability a reading is a wrong value
+    spike_pct: float = 50.0      # wrong value = measured range ± up to this %
     temperature_c: float = 20.0  # air temperature during the run
 
 
@@ -62,7 +71,8 @@ class SensorModel:
 
     def measure(self, pos, enabled, faults: Faults) -> tuple[list[int], list[str]]:
         """Return ``(ticks, status)`` — one tick count and one status label
-        (``ok``, ``off``, ``dropout``, ``range``, ``spike``) per receiver."""
+        (``ok``, ``off``, ``dropout``, ``range``, ``timeout``, ``spike``) per
+        receiver."""
         n     = len(self.coords)
         scale = speed_of_sound(self.cal_temp_c) / speed_of_sound(faults.temperature_c)
         true  = self.true_distances(pos)
@@ -76,8 +86,13 @@ class SensorModel:
                 status[i] = "range"
             elif self.rng.random() < faults.dropout_rate:
                 status[i] = "dropout"
+            elif self.rng.random() < faults.timeout_rate:
+                dist[i] = speed_of_sound(faults.temperature_c) * ECHO_TIMEOUT_S * 100.0
+                status[i] = "timeout"
             elif self.rng.random() < faults.spike_rate:
-                dist[i], status[i] = self.rng.uniform(0.0, self.max_range), "spike"
+                p = faults.spike_pct / 100.0
+                dist[i] *= 1.0 + self.rng.uniform(-p, p)
+                status[i] = "spike"
 
         ticks = []
         for i in range(n):

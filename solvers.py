@@ -3,7 +3,8 @@ Solvers — runs every positioning algorithm in the real ``ultragps_position``
 library on one frame of ticks.
 
 The library is a copy of ``libs/ultragps_position`` from UltraGPS-Control
-with one change: its receiver filter also drops distances <= 0 (see README).
+with two changes to its receiver filter: it drops distances <= 0, and its
+upper bound is an adjustable top-band reject, ``max_distance`` (see README).
 
 Algorithms shown:
 
@@ -60,8 +61,10 @@ def load_calibration(config_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
 
 class Solvers:
-    def __init__(self, config_path: str = DEFAULT_CONFIG, max_differential: float = 50.0):
-        self.lib = UltraGPSPositionLib(config_path, max_differential=max_differential)
+    def __init__(self, config_path: str = DEFAULT_CONFIG, max_differential: float = 50.0,
+                 max_distance: float | None = None):
+        self.lib = UltraGPSPositionLib(config_path, max_differential=max_differential,
+                                       max_distance=max_distance)
         # Subsets of size 3..n of n receivers, plus one: every subset is tried
         n = self.lib.receiver_count
         self.max_subsets = 2 ** n - sum(comb(n, k) for k in range(3)) + 1

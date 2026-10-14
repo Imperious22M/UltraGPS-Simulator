@@ -1,7 +1,7 @@
 """
 UltraGPS positioning simulator — interactive window.
 
-    python3 app.py [--config config/config.toml] [--max-differential 50]
+    python3 app.py [--config config/config.toml] [--max-differential 50] [--max-distance 400]
 
 Click the arena to send the transmitter somewhere, toggle receivers on and off,
 and drag the sliders to add noise and faults.  Every algorithm in the real
@@ -21,12 +21,12 @@ from matplotlib.widgets import Button, CheckButtons, Slider
 from simulation import Simulation
 from solvers import ALGORITHMS, DEFAULT_CONFIG
 
-DT          = 0.1   # s per frame — the base station's default 10 Hz
+DT          = 0.1   # default s per frame — the base station's default 10 Hz
 COLORS      = {"OLS": "tab:orange", "LM": "tab:blue", "CEP": "tab:green", "CEP4": "tab:purple"}
 LABELS      = {"OLS": "Linear LS (OLS)", "LM": "OLS + Levenberg-Marquardt", "CEP": "CEP best subset",
                "CEP4": "CEP, 4+ receivers, no box"}
 STATUS_FILL = {"ok": "tab:green", "off": "lightgray", "dropout": "tab:orange",
-               "range": "tab:orange", "spike": "tab:red"}
+               "range": "tab:orange", "timeout": "tab:brown", "spike": "tab:red"}
 PATH_RADIUS = 100.0
 
 
@@ -36,6 +36,7 @@ class App:
         self.paused  = False
         self.on_path = False
         self.angle   = 0.0
+        self.dt      = DT
         self.shown   = {a: True for a in ALGORITHMS}
 
         self.fig = plt.figure("UltraGPS positioning simulator", figsize=(13, 8))
@@ -79,12 +80,12 @@ class App:
         f, n = self.fig, len(self.sim.coords)
 
         f.text(0.64, 0.95, "Receivers", weight="bold")
-        self.tower_cb = CheckButtons(f.add_axes([0.64, 0.70, 0.14, 0.24]),
+        self.tower_cb = CheckButtons(f.add_axes([0.64, 0.74, 0.14, 0.20]),
                                      [f"R{i}" for i in range(n)], [True] * n)
         self.tower_cb.on_clicked(self._on_tower)
 
         f.text(0.80, 0.95, "Algorithms", weight="bold")
-        self.algo_cb = CheckButtons(f.add_axes([0.80, 0.76, 0.18, 0.18]),
+        self.algo_cb = CheckButtons(f.add_axes([0.80, 0.78, 0.18, 0.16]),
                                     list(ALGORITHMS), [True] * len(ALGORITHMS))
         self.algo_cb.on_clicked(self._on_algo)
 
@@ -93,20 +94,30 @@ class App:
             s = Slider(f.add_axes([0.72, y, 0.20, 0.025]), label, lo, hi, valinit=init, valfmt=fmt)
             s.on_changed(lambda _: self._on_slider())
             return s
-        self.s_noise = slider(0.62, "Noise σ (cm)",    0, 20,   fl.noise_cm,           "%.1f")
-        self.s_drop  = slider(0.58, "Dropouts (%)",    0, 50,   fl.dropout_rate * 100, "%.0f")
-        self.s_spike = slider(0.54, "Bad values (%)",  0, 50,   fl.spike_rate * 100,   "%.0f")
-        self.s_temp  = slider(0.50, "Air temp (°C)",   0, 40,   fl.temperature_c,      "%.0f")
-        self.s_speed = slider(0.46, "Speed (cm/s)",    5, 200,  self.sim.speed,        "%.0f")
+        lib = self.sim.solvers.lib
+        top = lib.max_distance if lib.max_distance is not None else lib._max_receiver_dist
+        rows = iter(0.70 - 0.033 * i for i in range(10))
+        self.s_noise   = slider(next(rows), "Noise σ (cm)",         0, 20,   fl.noise_cm,           "%.1f")
+        self.s_drop    = slider(next(rows), "Dropouts (%)",         0, 50,   fl.dropout_rate * 100, "%.0f")
+        self.s_timeout = slider(next(rows), "Lost signal (%)",      0, 50,   fl.timeout_rate * 100, "%.0f")
+        self.s_spike   = slider(next(rows), "Bad values (%)",       0, 50,   fl.spike_rate * 100,   "%.0f")
+        self.s_spkpct  = slider(next(rows), "Bad value range (±%)", 0, 100,  fl.spike_pct,          "%.0f")
+        self.s_temp    = slider(next(rows), "Air temp (°C)",        0, 40,   fl.temperature_c,      "%.0f")
+        self.s_speed   = slider(next(rows), "Speed (cm/s)",         5, 200,  self.sim.speed,        "%.0f")
+        self.s_top     = slider(next(rows), "Top-band reject (cm)", 50, 1500, top,                  "%.0f")
+        self.s_dt      = slider(next(rows), "Timestep (s)",      0.02, 1.0,  self.dt,               "%.2f")
 
-        self.b_pause = Button(f.add_axes([0.64, 0.38, 0.10, 0.045]), "Pause")
-        self.b_path  = Button(f.add_axes([0.76, 0.38, 0.10, 0.045]), "Circle path")
-        self.b_reset = Button(f.add_axes([0.88, 0.38, 0.10, 0.045]), "Reset stats")
+        y = 0.36
+        self.b_pause = Button(f.add_axes([0.64, y, 0.08, 0.04]), "Pause")
+        self.b_step  = Button(f.add_axes([0.73, y, 0.08, 0.04]), "Step")
+        self.b_path  = Button(f.add_axes([0.82, y, 0.08, 0.04]), "Circle path")
+        self.b_reset = Button(f.add_axes([0.91, y, 0.08, 0.04]), "Reset stats")
         self.b_pause.on_clicked(self._on_pause)
+        self.b_step.on_clicked(self._on_step)
         self.b_path.on_clicked(self._on_path)
         self.b_reset.on_clicked(lambda _: self.sim.reset())
 
-        self.info = f.text(0.64, 0.34, "", family="monospace", fontsize=9, va="top")
+        self.info = f.text(0.64, 0.335, "", family="monospace", fontsize=8.5, va="top")
 
     # ─── Callbacks ───────────────────────────────────────────────────────────
 
@@ -125,13 +136,25 @@ class App:
         fl = self.sim.faults
         fl.noise_cm      = self.s_noise.val
         fl.dropout_rate  = self.s_drop.val / 100
+        fl.timeout_rate  = self.s_timeout.val / 100
         fl.spike_rate    = self.s_spike.val / 100
+        fl.spike_pct     = self.s_spkpct.val
         fl.temperature_c = self.s_temp.val
         self.sim.speed   = self.s_speed.val
+        self.sim.solvers.lib.max_distance = self.s_top.val
+        self.dt = self.s_dt.val
+        if hasattr(self, "anim") and self.anim.event_source is not None:
+            self.anim.event_source.interval = int(self.dt * 1000)
 
     def _on_pause(self, _) -> None:
         self.paused = not self.paused
         self.b_pause.label.set_text("Resume" if self.paused else "Pause")
+
+    def _on_step(self, _) -> None:
+        if not self.paused:
+            self._on_pause(None)
+        self.advance()
+        self.fig.canvas.draw_idle()
 
     def _on_path(self, _) -> None:
         self.on_path = not self.on_path
@@ -139,13 +162,16 @@ class App:
     # ─── Frame ───────────────────────────────────────────────────────────────
 
     def update(self, _=None) -> None:
-        if self.paused:
-            return
+        if not self.paused:
+            self.advance()
+
+    def advance(self) -> None:
+        """Run one simulation frame of ``self.dt`` seconds and redraw."""
         if self.on_path:
-            self.angle += self.sim.speed * DT / PATH_RADIUS
+            self.angle += self.sim.speed * self.dt / PATH_RADIUS
             self.sim.target = PATH_RADIUS * np.array([np.cos(self.angle), np.sin(self.angle)])
 
-        f = self.sim.step(DT)
+        f = self.sim.step(self.dt)
 
         self.true_m.set_data([f["true"][0]], [f["true"][1]])
         self.target_m.set_data([self.sim.target[0]], [self.sim.target[1]])
@@ -181,7 +207,7 @@ class App:
             lines.append(f"{a:<10} {now:7.1f} {rms:7.1f} {fails:6d}")
         lines += [
             "",
-            f"frames     {self.sim.frames}",
+            f"frames     {self.sim.frames}   t = {self.sim.time:.1f} s",
             f"kept       {', '.join(f'R{i}' for i in f['sane']) or 'none'}",
             f"CEP used   {', '.join(f'R{i}' for i in f['cep_subset']) or 'none, holding last fix'}",
             f"CEP4 used  {', '.join(f'R{i}' for i in f['cep4_subset']) or 'none, holding last fix'}",
@@ -198,10 +224,12 @@ def main() -> None:
     p.add_argument("--config", default=DEFAULT_CONFIG, help="config.toml with receivers + calibration")
     p.add_argument("--max-differential", type=float, default=50.0,
                    help="library jump filter, cm per frame (default 50)")
+    p.add_argument("--max-distance", type=float, default=None,
+                   help="library top-band reject, cm (default: widest receiver spacing)")
     p.add_argument("--seed", type=int, default=None, help="random seed for repeatable runs")
     args = p.parse_args()
 
-    app = App(Simulation(args.config, args.max_differential, seed=args.seed))  # noqa: F841 (keeps the animation alive)
+    app = App(Simulation(args.config, args.max_differential, args.max_distance, seed=args.seed))  # noqa: F841 (keeps the animation alive)
     plt.show()
 
 

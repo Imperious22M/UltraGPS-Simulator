@@ -21,12 +21,13 @@ class Simulation:
         self,
         config_path: str = DEFAULT_CONFIG,
         max_differential: float = 50.0,
+        max_distance: float | None = None,
         history: int = 100,
         seed: int | None = None,
     ):
         coords, slopes, intercepts = load_calibration(config_path)
         self.sensor  = SensorModel(coords, slopes, intercepts, seed=seed)
-        self.solvers = Solvers(config_path, max_differential)
+        self.solvers = Solvers(config_path, max_differential, max_distance)
         self.coords  = coords
         self.faults  = Faults()
         self.enabled = [True] * len(coords)
@@ -37,6 +38,7 @@ class Simulation:
         self.trails  = {a: deque(maxlen=30) for a in ALGORITHMS}
         self.fails   = {a: 0 for a in ALGORITHMS}
         self.frames  = 0
+        self.time    = 0.0            # simulated seconds
         self.last    = None
 
     def reset(self) -> None:
@@ -46,6 +48,7 @@ class Simulation:
             self.trails[a].clear()
             self.fails[a] = 0
         self.frames = 0
+        self.time   = 0.0
 
     def step(self, dt: float = 0.1) -> dict:
         # Move toward the target at a fixed speed
@@ -57,6 +60,7 @@ class Simulation:
         ticks, status = self.sensor.measure(self.true, self.enabled, self.faults)
         result = self.solvers.solve(ticks)
         self.frames += 1
+        self.time   += dt
 
         for a in ALGORITHMS:
             pos = result["positions"][a]

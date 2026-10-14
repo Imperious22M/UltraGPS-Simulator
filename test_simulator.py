@@ -93,6 +93,32 @@ class SimulatorTest(unittest.TestCase):
         self.assertNotIn(5, frame["sane"])
         self.assertLess(sim.stats("LM")[0], 5.0)
 
+    def test_lost_signal_reports_high_value_rejected_by_top_band(self):
+        sim = Simulation(seed=0)
+        sim.faults = Faults(noise_cm=0.0, timeout_rate=1.0)
+        frame = run(sim, [30, 50], frames=1)
+        self.assertTrue(all(st == "timeout" for st in frame["status"]))
+        self.assertTrue(all(d > 1000 for d in frame["distances"]))
+        self.assertEqual(frame["sane"], [])
+
+    def test_top_band_reject_is_adjustable(self):
+        sim = Simulation(seed=0)
+        sim.faults = Faults(noise_cm=0.0)
+        sim.solvers.lib.max_distance = 200.0
+        frame = run(sim, [30, 50], frames=1)
+        far = [i for i, d in enumerate(frame["distances"]) if d > 200]
+        self.assertTrue(far)
+        self.assertFalse(set(far) & set(frame["sane"]))
+
+    def test_bad_value_stays_within_spike_range(self):
+        sim = Simulation(seed=0)
+        sim.faults = Faults(noise_cm=0.0, spike_rate=1.0, spike_pct=10.0)
+        for _ in range(20):
+            frame = run(sim, [30, 50], frames=1)
+            true = sim.sensor.true_distances(frame["true"])
+            ratio = np.array(frame["distances"]) / true
+            self.assertTrue(np.all(np.abs(ratio - 1) <= 0.10 + 0.01))
+
 
 if __name__ == "__main__":
     unittest.main()
