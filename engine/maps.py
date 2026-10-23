@@ -35,6 +35,10 @@ CEP4 or RANSAC and 1-2 minutes for the library's CEP.  Everything runs on the
 calling thread: ``progress(fraction)`` is called after each point and
 ``cancel()`` checked before each point and each of ``accuracy``'s pings; when
 it returns true the computation stops by raising ``Cancelled``.
+
+``run_job`` runs one of them in a child process for the maps window: Python
+threads share one interpreter lock, so on a thread beside the running
+simulation and the windows a map takes several times as long.
 """
 
 from __future__ import annotations
@@ -60,6 +64,26 @@ ALGORITHMS = ("OLS", "LM", "CEP", "CEP4", "ROBUST", "BIAS", "RANSAC")   # snapsh
 
 class Cancelled(Exception):
     """Raised inside a map computation once ``cancel()`` returns true."""
+
+
+def run_job(fn, events, stop) -> None:
+    """Child-process target: compute ``fn(progress=..., cancel=...)`` and send
+    ``("progress", fraction)`` messages, then one ``("done", result)``,
+    ``("cancelled", None)`` or ``("failed", text)``, through the ``events``
+    queue.  Setting the ``stop`` event cancels within one ping."""
+    sent = [0.0]
+
+    def progress(fraction: float) -> None:
+        if fraction - sent[0] >= 0.002 or fraction >= 1.0:   # a message per point would flood the queue
+            sent[0] = fraction
+            events.put(("progress", fraction))
+
+    try:
+        events.put(("done", fn(progress=progress, cancel=stop.is_set)))
+    except Cancelled:
+        events.put(("cancelled", None))
+    except Exception as exc:
+        events.put(("failed", str(exc)))
 
 
 @dataclass

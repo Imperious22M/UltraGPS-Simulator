@@ -4,9 +4,10 @@ system works and why: how many receivers hear the direct sound, where they
 time an echo instead, how good the receivers' geometry is, how far off the
 ranges are, and how accurate each algorithm is (``engine.maps``).
 
-A map is computed on its own thread from a copy of the simulation, so the
-simulation keeps running; it is drawn as coloured cells with a few contour
-lines under the walls, obstacles and receivers.  Hovering shows the value
+A map is computed in a child process from a copy of the simulation, so the
+simulation keeps running at full speed and so does the map (on a thread
+beside them it took several times as long).  It is drawn as coloured cells
+with a few contour lines under the walls, obstacles and receivers.  Hovering shows the value
 under the cursor.  "Show on arena" shades the main arena with it, with the
 same contour levels.  While a new map is computed, or after one failed or
 was cancelled, the previous map stays dimmed under a note saying so.
@@ -15,6 +16,8 @@ was cancelled, the previous map stays dimmed under a note saying so.
 from __future__ import annotations
 
 import math
+import multiprocessing
+import queue
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -207,24 +210,67 @@ def make_map(kind: MapKind, xs, ys, Z, n_receivers: int, title: str, detail: str
 # ─── Background computation ──────────────────────────────────────────────────
 
 class MapJob(QThread):
-    """Runs ``fn(progress=..., cancel=...)`` on its own thread."""
+    """Runs ``fn(progress=..., cancel=...)`` in a child process
+    (``maps.run_job``), relaying what it sends as signals.  Where no child
+    process can be started, ``fn`` runs on this thread instead."""
 
     progressed = pyqtSignal(float)
     computed   = pyqtSignal(object)        # (xs, ys, Z)
     failed     = pyqtSignal(str)
 
-    def __init__(self, fn, parent=None):
+    def __init__(self, fn, parent=None, process: bool = True):
         super().__init__(parent)
         self.fn        = fn
         self.cancelled = False
+        self.process   = process
 
     def run(self) -> None:
         try:
-            self.computed.emit(self.fn(progress=self.progressed.emit, cancel=lambda: self.cancelled))
+            if not (self.process and self._in_child()):
+                self.computed.emit(self.fn(progress=self.progressed.emit, cancel=lambda: self.cancelled))
         except maps.Cancelled:
             self.failed.emit("cancelled")
         except Exception as exc:      # show it rather than lose it with the thread
             self.failed.emit(f"failed: {exc}")
+
+    def _in_child(self) -> bool:
+        """Compute in a child process; false if none could be started."""
+        ctx = multiprocessing.get_context("spawn")      # a fork would copy the Qt threads' state
+        try:
+            events, stop = ctx.Queue(), ctx.Event()
+            child = ctx.Process(target=maps.run_job, args=(self.fn, events, stop), daemon=True)
+            child.start()
+        except Exception:             # no process support here (a sandbox, a frozen app)
+            return False
+        try:
+            while True:
+                if self.cancelled:
+                    stop.set()
+                try:
+                    kind, value = events.get(timeout=0.05)
+                except queue.Empty:
+                    if not child.is_alive() and events.empty():
+                        self.failed.emit(f"failed: the map process stopped (exit code {child.exitcode})")
+                        return True
+                    continue
+                if kind == "progress":
+                    self.progressed.emit(value)
+                    continue
+                if kind == "done":
+                    self.computed.emit(value)
+                elif kind == "cancelled":
+                    self.failed.emit("cancelled")
+                else:
+                    self.failed.emit(f"failed: {value}")
+                return True
+        finally:
+            stop.set()
+            child.join(5)
+            if child.is_alive():
+                child.terminate()
+                child.join()
+            events.close()
+            events.join_thread()
 
 
 # ─── Canvas ──────────────────────────────────────────────────────────────────

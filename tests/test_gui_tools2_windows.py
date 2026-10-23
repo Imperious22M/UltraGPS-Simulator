@@ -2,13 +2,17 @@
 failures instead of aborting, points that can't be calibrated on refused,
 line-of-sight warnings, true values in the current air, cancelling a run, an
 error message that wraps, merged plot labels; and the maps' contour levels on
-the arena, the CEP no-fix note and the dimmed previous map.  Every
-calibration writes to a temp copy of config.toml."""
+the arena, the CEP no-fix note, the dimmed previous map and the child process
+maps are computed in.  Every calibration writes to a temp copy of
+config.toml."""
 
+import multiprocessing
 import os
 import tempfile
 import time
 import unittest
+from functools import partial
+from unittest import mock
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ.setdefault("XDG_CONFIG_HOME", tempfile.mkdtemp())
@@ -27,7 +31,7 @@ from engine.simulation import Simulation
 from engine.world import Obstacle
 from gui import theme
 from gui.calibration_window import CalibrationWindow, ResponsePlot, _merged_labels, calibration_error
-from gui.map_window import KINDS, MapWindow, make_map
+from gui.map_window import KINDS, MapJob, MapWindow, make_map
 
 app = QApplication.instance() or QApplication([])
 
@@ -350,6 +354,38 @@ class MapWindowTest(unittest.TestCase):
         for name in ("paper", "vector"):
             theme.apply(app, name)
             self.assertTrue(not_blank(self.win.canvas))
+
+
+class MapJobTest(unittest.TestCase):
+    def run_job(self, fn, process: bool = True):
+        job  = MapJob(fn, process=process)
+        seen = {"progress": [], "done": [], "failed": []}
+        job.progressed.connect(seen["progress"].append)
+        job.computed.connect(seen["done"].append)
+        job.failed.connect(seen["failed"].append)
+        job.start()
+        self.assertTrue(wait_for(job.isFinished, 60))
+        return seen
+
+    def test_a_child_process_gives_the_same_map_as_this_thread(self):
+        fn    = partial(maps.coverage, maps.scene(ideal_sim()), 40.0)
+        child = self.run_job(fn)
+        here  = self.run_job(fn, process=False)
+        self.assertEqual((child["failed"], len(child["done"])), ([], 1))
+        np.testing.assert_array_equal(child["done"][0][2], here["done"][0][2])
+        self.assertEqual(child["progress"][-1], 1.0)
+        self.assertEqual(child["progress"], sorted(child["progress"]))
+
+    def test_a_failure_in_the_child_is_reported(self):
+        seen = self.run_job(partial(maps.coverage, None, 40.0))
+        self.assertEqual(seen["done"], [])
+        self.assertTrue(seen["failed"][0].startswith("failed:"), seen["failed"])
+
+    def test_without_child_processes_the_map_is_computed_here(self):
+        spawn = type(multiprocessing.get_context("spawn"))
+        with mock.patch.object(spawn, "Process", side_effect=OSError("no processes here")):
+            seen = self.run_job(partial(maps.coverage, maps.scene(ideal_sim()), 40.0))
+        self.assertEqual((seen["failed"], len(seen["done"])), ([], 1))
 
 
 if __name__ == "__main__":

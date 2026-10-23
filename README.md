@@ -47,10 +47,13 @@ python3 -m unittest discover -s tests -t .
 
 ## Relationship to the other UltraGPS repositories
 
-This repository does not modify or depend on any other repository at run
-time. These are copied in from
+This repository does not modify or depend on any other repository at run time.
+These are copied in from
 [UltraGPS-Control](https://github.com/Imperious22M/UltraGPS-Control) at commit
-`f8f4f73`, and the simulator never edits them (a test checks their SHA-256):
+`f8f4f73`. The simulator never edits the two libraries (a test checks their
+SHA-256), but it does write config.toml: the calibration window saves offsets
+and calibration points to it, and so does `python3 -m engine.cal_points
+--apply`:
 
 - `ultragps_position/` — the positioning library (`libs/ultragps_position`)
 - `ultragps_calibration/` — the calibration library (`libs/ultragps_calibration`)

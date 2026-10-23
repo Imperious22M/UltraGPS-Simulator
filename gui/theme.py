@@ -197,9 +197,7 @@ def apply(app, name: str = "vector") -> Palette:
     collecting = gc.isenabled()
     gc.disable()
     try:
-        if app.property("ultragps_style") != "Fusion":     # once: each call makes a new style object
-            app.setStyle("Fusion")
-            app.setProperty("ultragps_style", "Fusion")
+        app.setStyle("Fusion")             # also tells every widget to restyle (StyleChange)
         app.setPalette(pal)
         app.setFont(ui_font())
         app.setStyleSheet(stylesheet(p))
