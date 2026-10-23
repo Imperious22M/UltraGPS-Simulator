@@ -28,18 +28,22 @@ python3 -m unittest discover -s tests -t .
   layout, drawn in a 2D vector style (dark or light, exports to SVG).
 - A model of one ping through the real hardware: beam patterns, spreading,
   air absorption, threshold detection with range walk, loss of signal,
-  reflections off walls and obstacles, sound bending round corners, wind,
-  radio trigger timing and loss, the HC-SR04 timeout and the base station's
-  sampling window. An echo scope shows every arrival at every receiver.
-- The library's OLS, LM and CEP next to five simulator-only algorithms:
-  CEP with 4+ receivers, robust LM, LM with a common offset, RANSAC and a
-  Kalman tracker.
+  reflections off walls and obstacles, sound bending round corners, a direct
+  sound and its echo interfering, ambient ultrasonic noise, module-to-module
+  differences, wind, radio trigger timing and loss, the HC-SR04 timeout and
+  the base station's sampling window. An echo scope shows every arrival at
+  every receiver.
+- The library's OLS, LM and CEP (searching the 15 subsets UltraGPS-Control
+  uses, or all of them) next to five simulator-only algorithms: CEP with 4+
+  receivers, robust LM, LM with a common offset, RANSAC and a Kalman tracker.
 - An algorithm lab that animates the library's CEP subset search, the effect
   of blocked receivers, and the LM optimiser, step by step with the library's
   own equations and numbers.
 - Calibration through the real calibration library, with a search for the
-  best calibration points; coverage, multipath, geometry and accuracy maps;
-  recording, and replay of real base-station tick logs; a benchmark.
+  best calibration points in the room; coverage, multipath, geometry and
+  accuracy maps; recording, and replay of real base-station tick logs and
+  serial-monitor captures; a benchmark with a regression check against a
+  recording.
 
 ## Relationship to the other UltraGPS repositories
 

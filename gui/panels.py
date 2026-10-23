@@ -796,8 +796,8 @@ ENV_GROUPS = [
                   "during calibration every range reads short: about 0.18 % per °C, 0.5 cm at 3 m. "
                   "It also changes how fast ultrasound fades."),
         Field("humidity_pct", "Humidity", "float", 0, 100, 1, "%",
-              tip="Relative humidity. Moist air carries sound slightly faster (about 0.6 m/s from dry "
-                  "to saturated) and changes how strongly 40 kHz ultrasound is absorbed (ISO 9613-1)."),
+              tip="Relative humidity. Moist air carries sound slightly faster (dry to saturated adds "
+                  "about 1.3 m/s at 20 °C, 2.4 at 30 °C, 5.6 at 45 °C) and changes how strongly 40 kHz ultrasound is absorbed (ISO 9613-1)."),
         Field("cal_temperature_c", "Calibrated at", "float", -10, 45, 0.5, "°C",
               tip="Air temperature when the receivers were calibrated. Times are turned into distances "
                   "at that speed of sound, so any change since shows up as a range error that grows "
@@ -861,7 +861,8 @@ ENV_GROUPS = [
                   "cycles late (range walk, 0.86 cm per 25 µs cycle) or never (signal lost: the module "
                   "times out). Off: ideal timing, every arrival detected at once."),
         Field("snr_db", "Signal margin", "float", 0, 60, 0.5, "dB",
-              tip="How far the burst is above the detection threshold, on axis at 1 m. Sound fades "
+              tip="How far the burst is above the detection threshold, on axis at 1 m, before air "
+                  "absorption. Sound fades "
                   "as 1/distance plus about 1.3 dB/m absorption, so a smaller margin loses distant "
                   "and off-axis receivers first. Models a weak transmitter, low receiver gain or a "
                   "noisy room.", needs=lambda v: v("threshold")),
@@ -904,7 +905,8 @@ ENV_GROUPS = [
         Field("reflections", "Reflections", "bool",
               tip="Sound bounces off walls and obstacles (image-source method). A reflection always "
                   "travels further than the direct sound, so it only matters when the direct sound "
-                  "is blocked or too weak: then the receiver reads long."),
+                  "is blocked or too weak: then the receiver reads long. A short echo off a nearby "
+                  "wall can also overlap the direct sound (see Interference)."),
         Field("bounces", "Bounces", "int", 1, 2, 1, "",
               tip="Most bounces per path. Each bounce keeps only the surface's reflectivity of the "
                   "amplitude, so two-bounce paths are weak.", needs=lambda v: v("reflections")),
@@ -922,10 +924,12 @@ ENV_GROUPS = [
                   "sent its own burst; anything arriving earlier is not heard."),
         Field("timeout_ms", "Module timeout", "float", 10, 200, 1, "ms",
               tip="With nothing detected, an HC-SR04 gives up after this long and drops its echo line "
-                  "anyway: the base station reads a very high value (signal lost)."),
+                  "anyway: the base station reads a very high value (signal lost). A detection later than this "
+                  "reads lost too."),
         Field("window_ms", "Sampling window", "float", 10, 100, 1, "ms",
               tip="The base station times the echo lines for this long (80 % of the 100 ms frame). A "
-                  "line still high at the end reads 0."),
+                  "line still high at the end reads 0 (missed), however late the sound would have "
+                  "been detected."),
         Field("sync_offset_us", "Trigger offset", "float", -500, 500, 5, "µs",
               tip="The transmitter fires late by this constant amount (radio and PLL latency). Every "
                   "range reads long by the same 3.4 cm per 100 µs: the BIAS algorithm can absorb it."),
@@ -939,7 +943,8 @@ ENV_GROUPS = [
                   "one tick off."),
         Field("crosstalk", "Crosstalk", "bool",
               tip="Each receiver HC-SR04 also sends its own burst when triggered (unmodified "
-                  "modules). Other receivers can hear it, and it reads short."),
+                  "modules). Other receivers can hear it, and it reads short. A "
+                  "receiver also hears its own burst echo off the walls, even with Reflections off."),
     ]),
 ]
 

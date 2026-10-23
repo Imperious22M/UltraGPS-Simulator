@@ -58,8 +58,9 @@ KINDS = {k.key: k for k in (
     MapKind("nlos", "First arrival not direct (NLOS)", "receivers that do not time the direct sound",
             "not direct, receivers", "receivers", True, 10.0,
             "How many receivers would time something other than the direct sound from each point: a "
-            "reflection (reads long), sound bent round an obstacle (reads a little long), another "
-            "receiver's burst, or nothing (the HC-SR04 times out). These are the outliers the CEP "
+            "reflection (reads long), sound bent round an obstacle (reads a little long), the direct "
+            "sound and a short echo adding up out of phase (fade), another receiver's burst, noise, "
+            "or nothing (the HC-SR04 times out). These are the outliers the CEP "
             "subset search, RANSAC and the robust fit exist to reject. Zero is ideal (the dashed line "
             "encloses it). Keep calibration points in the zero area: a receiver calibrated on an "
             "echo is wrong everywhere."),
@@ -651,7 +652,7 @@ class MapWindow(QMainWindow):
         self.job.start()
 
     def cancel(self) -> None:
-        """Stop the computation at the next grid point."""
+        """Stop the computation within one ping (the next grid point)."""
         if self.job is not None:
             self.job.cancelled = True
 

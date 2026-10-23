@@ -569,6 +569,20 @@ class HatchTest(unittest.TestCase):
         pieces = _inside_pieces(QPointF(-5, 7), QPointF(15, 7), notch)
         self.assertEqual([(round(a, 3), round(b, 3)) for a, b in pieces], [(0.25, 0.45), (0.55, 0.75)])
 
+    def test_a_huge_zoom_hatches_only_what_is_on_the_page(self):
+        QApplication.instance() or QApplication([])
+        img = QImage(200, 150, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        v = draw.View()
+        v.resize(200, 150)
+        v.scale = 1e12                                   # a 1 m box is 10¹² pixels wide
+        p = QPainter(img)
+        t0 = time.perf_counter()
+        draw.hatched_polygon(p, v, [(-50, -50), (50, -50), (50, 50), (-50, 50)], "#ff0000")
+        p.end()
+        self.assertLess(time.perf_counter() - t0, 1.0)
+        self.assertTrue(any(img.pixel(x, 75) for x in range(200)))   # the page is inside the box: hatched
+
 
 if __name__ == "__main__":
     unittest.main()

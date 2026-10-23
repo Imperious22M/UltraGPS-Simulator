@@ -598,9 +598,9 @@ class EchoScope(QWidget):
         thr.lineTo(plot.right(), Ydb(0))
         draw.stroke(p, thr, pal.text_muted, 1.0, 0.55, draw.DOT, glow=False)
 
-        # The echo line drops where the comparator fires (an injected timeout
-        # reads as if it dropped at the module's timeout)
-        drop       = env.rx_ready_ms + env.timeout_ms if r.status == "timeout" else r.echo_ms
+        # The echo line drops where the comparator fires (the hardware gives an
+        # injected timeout the module's timeout as its echo time)
+        drop       = r.echo_ms
         falls      = drop is not None and drop <= t_end
         dropped_by = r.detected if falls and r.status != "timeout" else None
 

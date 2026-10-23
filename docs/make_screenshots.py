@@ -5,16 +5,19 @@ Regenerate the pictures in MANUAL.md:
 
 Each picture is a fixed, seeded scene, so a change to the drawing code shows up
 as a change in the picture.  Calibration runs against a temporary copy of
-config.toml; nothing in config/ is touched.
+config.toml, and the windows keep their settings in a temporary folder, so
+nothing in config/ or your saved layout is touched or used.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp(prefix="ultragps-shots-")   # no saved layout or palette
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
@@ -67,9 +70,14 @@ def main_window(palette: str, name: str, setup=None, frames: int = 60, motion: s
         setup(sim, win)
     for _ in range(frames):
         win.on_frame(sim.step(win.runner.dt))
-    pump(seconds=0.2)
+    # The last frame as a running simulator shows it (as app.py --screenshot)
+    win.runner.paused    = False
+    win.runner.real_rate = 1.0 / win.runner.dt
+    pump(seconds=0.2)                       # past the panels' 0.1 s refresh limit
     win.on_frame(sim.last)
+    pump(seconds=0.05)
     save(win, name)
+    win.runner.paused = True
     win.close()
 
 

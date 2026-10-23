@@ -355,6 +355,7 @@ class ShortcutTest(WindowTest):
         combo = win.scenario.form.editors["mode"]
         self.assertEqual(self.press(combo, Qt.Key.Key_1, Qt.KeyboardModifier.ControlModifier),
                          [win.rx_actions[1]])                                        # Ctrl keys always
+        self.assertEqual(self.press(combo, Qt.Key.Key_Right), [win.a_step])         # a combo ignores Right
 
     def test_the_key_filter_comes_off_when_the_loop_ends_or_the_window_closes(self):
         # PyQt's clean-up at exit crashes in an application filter still installed

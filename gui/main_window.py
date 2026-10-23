@@ -73,11 +73,14 @@ NAV_KEYS = {Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down, Q
 
 def wants_key(widget, key, text: str) -> bool:
     """Does the focused ``widget`` use this key (no Ctrl, Alt or Meta) itself?"""
-    if isinstance(widget, QComboBox):                 # Space opens it, arrows and letters choose
-        return key == Qt.Key.Key_Space or key in NAV_KEYS or (text.isprintable() and text.strip() != "")
+    if isinstance(widget, QComboBox):                 # Space opens it, Up, Down and letters choose
+        return (key == Qt.Key.Key_Space or (key in NAV_KEYS and key not in (Qt.Key.Key_Left, Qt.Key.Key_Right))
+                or (text.isprintable() and text.strip() != ""))
     if isinstance(widget, QAbstractButton):           # Space presses it
         return key == Qt.Key.Key_Space
-    if isinstance(widget, (QAbstractSlider, QAbstractItemView, QTabBar)):
+    if isinstance(widget, QTabBar):                   # the arrows change the tab
+        return key in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+    if isinstance(widget, (QAbstractSlider, QAbstractItemView)):
         return key in NAV_KEYS
     return False
 

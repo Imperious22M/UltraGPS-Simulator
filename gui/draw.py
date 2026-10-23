@@ -322,15 +322,19 @@ def hatched_polygon(p: QPainter, view: View, pts, c: str, spacing_px: float = 7.
     path    = QPainterPath()
     path.addPolygon(QPolygonF(corners))
     path.closeSubpath()
-    r = path.boundingRect().adjusted(-1, -1, 1, 1)
+    # Hatch only the part on the page: a huge zoom must not mean millions of lines.
+    # The lines are x + y = n·spacing, so they stay put however the outline is cut.
+    page = p.transform().inverted()[0].mapRect(QRectF(p.viewport()))
+    r = path.boundingRect().adjusted(-1, -1, 1, 1).intersected(page)
     p.setPen(pen(c, 0.8, alpha * 0.45))
-    k = -r.height()
-    while k < r.width():
-        a = QPointF(r.left() + k, r.bottom())
-        b = QPointF(r.left() + k + r.height(), r.top())
-        for t0, t1 in _inside_pieces(a, b, corners):
-            p.drawLine(a + (b - a) * t0, a + (b - a) * t1)
-        k += spacing_px
+    if not r.isEmpty():
+        k = math.ceil((r.left() + r.top()) / spacing_px) * spacing_px
+        while k < r.right() + r.bottom():
+            a = QPointF(k - r.bottom(), r.bottom())
+            b = QPointF(k - r.top(), r.top())
+            for t0, t1 in _inside_pieces(a, b, corners):
+                p.drawLine(a + (b - a) * t0, a + (b - a) * t1)
+            k += spacing_px
     stroke(p, path, c, width, alpha)
 
 
