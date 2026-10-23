@@ -167,6 +167,18 @@ class SimulatorTest(unittest.TestCase):
         truth = sorted(load_config(DEFAULT_SENSORS)["receivers"], key=lambda r: r["id"])
         np.testing.assert_allclose(sim.sensor.slopes, [r["slope"] for r in truth])
 
+    def test_calibration_point_search_beats_current_points(self):
+        import cal_points
+        sim = Simulation(seed=0)
+        sets = cal_points.search(sim.coords, max_points=4)
+        cfg = load_config(DEFAULT_CONFIG)
+        current = cal_points.arena_score([cfg["cal_point_1"], cfg["cal_point_2"]], sim.coords)
+        scores = [cal_points.arena_score(sets[n], sim.coords) for n in (2, 3, 4)]
+        self.assertLess(scores[0], current)
+        self.assertEqual(scores, sorted(scores, reverse=True))   # more points, lower error
+        for n in (2, 3, 4):
+            self.assertEqual(len(sets[n]), n)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -150,6 +150,40 @@ library's `save_offsets()` and reloads the positioning library. **Reload from
 file** discards unsaved edits. To model hardware that has drifted from its
 calibration, edit `sensors.toml` instead.
 
+### Choosing calibration points
+
+`cal_points.py` searches for the set of 2, 3 or 4 calibration points that
+gives each receiver the most accurate slope and intercept, then checks the
+winners by calibrating many times on the simulated sensors:
+
+```bash
+python3 cal_points.py                 # best 2, 3 and 4 points, check, plot to cal_points.png
+python3 cal_points.py --apply         # also write the best 2-point set into config.toml
+```
+
+A receiver's fit is accurate when its calibration points sit at very
+different distances from it. The search scores a point set by the RMS distance
+error its calibration would cause across the arena, for all six receivers
+(this combines slope and intercept error in cm), searches a grid at least
+`--margin` cm (default 30) inside the receivers' box and within 400 cm of
+every receiver, and refines on a 5 cm grid. It is a local search, so the sets
+are very good rather than proven optimal.
+
+Result with 1 cm noise, 200 simulated calibrations per set:
+
+| Set | Points (cm) | Slope error | Intercept error | Distance error |
+|-----|-------------|-------------|-----------------|----------------|
+| current | (0, 76), (−76, 0) | 2.76 % | 9.9 cm | 2.94 cm |
+| best 2 | (−82, −152), (78, 153) | 0.64 % | 2.4 cm | 0.69 cm |
+| best 3 | (−97, −92), (58, 123), (93, −147) | 0.47 % | 1.7 cm | 0.51 cm |
+| best 4 | (−97, −142), (93, 98), (93, −147), (−97, 98) | 0.33 % | 1.2 cm | 0.40 cm |
+
+![Calibration points](cal_points.png)
+
+The calibration library only supports two points, so `--apply` writes the
+best 2-point set. The 3- and 4-point results use a least-squares line through
+all points (for 2 points this is exactly the library's formula).
+
 ## Sensor model
 
 `sensor_model.py` turns a true position into ticks: straight-line range,
@@ -168,6 +202,7 @@ ticks by inverting each receiver's true response from `sensors.toml`
 | `sensor_model.py` | Physics and faults: position → ticks |
 | `solvers.py` | Runs each algorithm in the library on one frame |
 | `calibration.py` | Runs the calibration library on the simulated sensors; reads and saves offsets |
+| `cal_points.py` | Searches for the calibration points that minimise calibration error |
 | `ultragps_position/` | Copy of the positioning library (two filter changes, above) |
 | `ultragps_calibration/` | Copy of the calibration library (unmodified) |
 | `config/sensors.toml` | The simulated hardware's true tick response |
