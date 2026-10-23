@@ -632,10 +632,10 @@ average out range walk, which differs from point to point.
 the receivers' box and 30 cm round it, so you can see at a glance where the
 system works and why. A map is computed in a separate process from a copy of
 the simulation, so the simulation keeps running (a little slower) and the map
-takes about as long as with the simulation paused; while it computes, and
-after it fails or is cancelled (**Cancel** stops it within one ping), the
-previous map stays on screen dimmed. Hover for the value under the cursor, and
-**Show on arena** shades the main arena with it, contour lines included.
+takes only a little longer than paused; while it computes, and after it fails
+or is cancelled (**Cancel** stops it within one ping), the previous map stays
+on screen dimmed. Hover for the value under the cursor, and **Show on arena**
+shades the main arena with it, contour lines included.
 
 | Map | Value at each point | Use it to |
 |---|---|---|

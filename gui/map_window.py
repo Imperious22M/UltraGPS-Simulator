@@ -5,9 +5,9 @@ time an echo instead, how good the receivers' geometry is, how far off the
 ranges are, and how accurate each algorithm is (``engine.maps``).
 
 A map is computed in a child process from a copy of the simulation, so the
-simulation keeps running (a little slower) and the map takes about as long as
-with the simulation paused (on a thread beside them it took several times as
-long).  It is drawn as coloured cells with a few contour lines under the
+simulation keeps running (a little slower) and the map takes only a little
+longer than with the simulation paused (on a thread beside them it took
+several times as long).  It is drawn as coloured cells with a few contour lines under the
 walls, obstacles and receivers.  Hovering shows the value under the cursor.
 "Show on arena" shades the main arena with it, with the same contour levels.
 While a new map is computed, or after one failed or was cancelled, the
