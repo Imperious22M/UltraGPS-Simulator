@@ -3,6 +3,14 @@ UltraGPS Calibration Library — core module
 ==========================================
 Standalone two-point histogram calibration library for the UltraGPS system.
 
+.. note::
+    **Simulator copy.**  This copy is extended from two calibration points to
+    up to ``MAX_POINTS`` (4).  The points come from ``cal_points`` in
+    config.toml when present (else ``cal_point_1`` / ``cal_point_2``), each
+    receiver's ``cal_distances`` holds one distance per point, run *k*
+    collects at point *k*, and the offsets are a least-squares line through
+    all points, which for two points is exactly the original formula below.
+
 Drives the UltraGPS hardware via an ``UltraGPSClient`` instance to collect
 tick readings at two known calibration points, then computes per-receiver
 linear calibration offsets (slope + intercept) and writes them back to
@@ -129,7 +137,7 @@ def _write_config(config_path: str, config: dict) -> None:
                     f.write(f"{key} = {value}\n")
 
         # Calibration point arrays
-        for key in ["cal_point_1", "cal_point_2"]:
+        for key in ["cal_point_1", "cal_point_2", "cal_points"]:
             if key in config:
                 f.write(f"{key} = {config[key]}\n")
 
@@ -178,6 +186,9 @@ class UltraGPSCalibration:
     RECEIVER_COUNT: int = 6
     """Number of receivers expected per pulse reading."""
 
+    MAX_POINTS: int = 4
+    """Maximum number of calibration points (one collection run each)."""
+
     HISTOGRAM_UPDATE_INTERVAL: int = 5
     """How many reads between successive ``on_reading`` callback invocations."""
 
@@ -187,8 +198,8 @@ class UltraGPSCalibration:
 
         # Histogram store: run_num → receiver_id → {tick_value: count}
         self._histogram: dict[int, dict[int, dict[float, int]]] = {
-            1: {i: {} for i in range(self.RECEIVER_COUNT)},
-            2: {i: {} for i in range(self.RECEIVER_COUNT)},
+            run: {i: {} for i in range(self.RECEIVER_COUNT)}
+            for run in range(1, self.MAX_POINTS + 1)
         }
 
         self._running: bool = False
@@ -207,8 +218,8 @@ class UltraGPSCalibration:
         Args:
             run_num: 1 or 2 — which run's data to clear.
         """
-        if run_num not in (1, 2):
-            raise ValueError(f"run_num must be 1 or 2, got {run_num}")
+        if not 1 <= run_num <= self.MAX_POINTS:
+            raise ValueError(f"run_num must be 1 to {self.MAX_POINTS}, got {run_num}")
         with self._lock:
             self._histogram[run_num] = {i: {} for i in range(self.RECEIVER_COUNT)}
 
@@ -294,6 +305,16 @@ class UltraGPSCalibration:
         return list(_load_config(self._config_path).get("cal_point_2", [0.0, 0.0]))
 
     @property
+    def cal_points(self) -> list[list[float]]:
+        """All calibration points ``[[x, y], ...]`` (cm): ``cal_points`` from
+        config.toml, or ``[cal_point_1, cal_point_2]`` if it is absent."""
+        config = _load_config(self._config_path)
+        if "cal_points" in config:
+            return [list(p) for p in config["cal_points"]]
+        return [list(config.get("cal_point_1", [0.0, 0.0])),
+                list(config.get("cal_point_2", [0.0, 0.0]))]
+
+    @property
     def calibration_reads(self) -> int:
         """Default minimum reads per receiver, from ``calibration_reads`` in config.toml."""
         return int(_load_config(self._config_path).get("calibration_reads", 5))
@@ -365,8 +386,8 @@ class UltraGPSCalibration:
             ValueError:  If *run_num* is not 1 or 2.
             RuntimeError: If a run is already in progress.
         """
-        if run_num not in (1, 2):
-            raise ValueError(f"run_num must be 1 or 2, got {run_num}")
+        if not 1 <= run_num <= self.MAX_POINTS:
+            raise ValueError(f"run_num must be 1 to {self.MAX_POINTS}, got {run_num}")
 
         with self._lock:
             if self._running:
@@ -430,27 +451,33 @@ class UltraGPSCalibration:
                 )
                 continue
 
-            known_dist_1, known_dist_2 = cal_distances[0], cal_distances[1]
+            n     = min(len(cal_distances), self.MAX_POINTS)
+            dists = cal_distances[:n]
+            ticks = [self.get_most_frequent(recv_id, run) for run in range(1, n + 1)]
 
-            tick_1 = self.get_most_frequent(recv_id, 1)
-            tick_2 = self.get_most_frequent(recv_id, 2)
-
-            if tick_1 is None or tick_2 is None:
+            if any(t is None for t in ticks):
                 print(
                     f"[calibration] Receiver {recv_id + 1}: "
-                    "no histogram data for one or both runs — skipped"
+                    "no histogram data for one or more runs — skipped"
                 )
                 continue
 
-            if tick_1 == tick_2:
+            if len(set(ticks)) == 1:
                 print(
                     f"[calibration] Receiver {recv_id + 1}: "
-                    f"identical tick values for both runs ({tick_1}) — skipped"
+                    f"identical tick values for all runs ({ticks[0]}) — skipped"
                 )
                 continue
 
-            slope = (known_dist_1 - known_dist_2) / (tick_1 - tick_2)
-            intercept = known_dist_1 - slope * tick_1
+            # Least-squares line through (tick, distance); for two points this
+            # is slope = (d1 - d2) / (t1 - t2), intercept = d1 - slope * t1.
+            t_mean = sum(ticks) / n
+            d_mean = sum(dists) / n
+            slope = (
+                sum((t - t_mean) * (d - d_mean) for t, d in zip(ticks, dists))
+                / sum((t - t_mean) ** 2 for t in ticks)
+            )
+            intercept = d_mean - slope * t_mean
 
             offsets[recv_id] = {"slope": slope, "intercept": intercept}
             print(
@@ -543,30 +570,17 @@ class UltraGPSCalibration:
         if min_reads is None:
             min_reads = self.calibration_reads
 
-        # ── Run 1 ─────────────────────────────────────────────────────────
-        self.clear_run_data(1)
-        run1_done = threading.Event()
+        # ── One run per calibration point, gated in between ───────────────
+        for run in range(1, min(len(self.cal_points), self.MAX_POINTS) + 1):
+            if run > 1 and on_between_runs is not None:
+                if not on_between_runs():
+                    return {}
 
-        def _on_complete_1(run_num: int) -> None:
-            run1_done.set()
-
-        self.start_run(1, min_reads, on_reading=on_reading, on_complete=_on_complete_1)
-        run1_done.wait()
-
-        # ── Between-runs gate ─────────────────────────────────────────────
-        if on_between_runs is not None:
-            if not on_between_runs():
-                return {}
-
-        # ── Run 2 ─────────────────────────────────────────────────────────
-        self.clear_run_data(2)
-        run2_done = threading.Event()
-
-        def _on_complete_2(run_num: int) -> None:
-            run2_done.set()
-
-        self.start_run(2, min_reads, on_reading=on_reading, on_complete=_on_complete_2)
-        run2_done.wait()
+            self.clear_run_data(run)
+            done = threading.Event()
+            self.start_run(run, min_reads, on_reading=on_reading,
+                           on_complete=lambda run_num: done.set())
+            done.wait()
 
         # ── Calculate and persist offsets ─────────────────────────────────
         return self.calculate_and_save_offsets()

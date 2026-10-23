@@ -29,7 +29,8 @@ repository at run time. These are copied in from
 `f8f4f73`:
 
 - `ultragps_position/` — the positioning library (`libs/ultragps_position`)
-- `ultragps_calibration/` — the calibration library (`libs/ultragps_calibration`), unmodified
+- `ultragps_calibration/` — the calibration library (`libs/ultragps_calibration`),
+  extended from two to up to four calibration points (see Calibration below)
 - `config/config.toml` — receiver positions and calibration; the simulator's
   calibration routine and calibration window write new offsets into it
 
@@ -76,7 +77,10 @@ these changes (`diff` against UltraGPS-Control shows them).
 | Top-band reject | The library filter drops any distance above this (default: widest receiver spacing) |
 | Timestep | Simulated seconds per frame, and the time between frames when running |
 | **Pause** / **Step** | Stop the run / advance exactly one frame (Step pauses first) |
-| **Calibrate** | Run the calibration library's two-point routine on the simulated sensors (see below) |
+| **Cal points: N** | Choose how many calibration points (2, 3 or 4) Search and Manual selection place |
+| **Search points** | Find the best N points with the search below, show them on the arena and save them |
+| **Manual selection** | Click N points on the arena instead (press again to cancel) |
+| **Calibrate** | Run the calibration library's routine on the simulated sensors at those points (see below) |
 | **Modify calibration values** | Open a window to edit each receiver's slope and intercept, then **Save & apply** |
 
 The panel on the right shows each algorithm's current and RMS error against the
@@ -133,10 +137,10 @@ library sees is off by the calibration error, as on the real system.
 **Calibrate** runs `UltraGPSCalibration.run_full_calibration()` from the real
 calibration library. `SimClient` in `calibration.py` stands in for the network
 client: each `pulse()` measures the simulated sensors with the transmitter
-parked on `cal_point_1` (P1 on the arena), then `cal_point_2` (P2). The library
-collects readings until each receiver's most frequent tick has been seen
-`calibration_reads` times, fits slope and intercept from the two points, and
-writes them to `config.toml`. The simulator then reloads the positioning
+parked on each calibration point in turn (P1, P2, ... on the arena). The
+library collects readings until each receiver's most frequent tick has been
+seen `calibration_reads` times, fits slope and intercept, and writes them to
+`config.toml`. The simulator then reloads the positioning
 library, so the new offsets are used straight away. The current noise, faults,
 temperature and switched-off receivers all apply during calibration, so you
 can see how they turn into calibration error. A receiver whose two calibration
@@ -158,7 +162,7 @@ winners by calibrating many times on the simulated sensors:
 
 ```bash
 python3 cal_points.py                 # best 2, 3 and 4 points, check, plot to cal_points.png
-python3 cal_points.py --apply         # also write the best 2-point set into config.toml
+python3 cal_points.py --apply         # also write the best 4-point set into config.toml
 ```
 
 A receiver's fit is accurate when its calibration points sit at very
@@ -180,9 +184,25 @@ Result with 1 cm noise, 200 simulated calibrations per set:
 
 ![Calibration points](cal_points.png)
 
-The calibration library only supports two points, so `--apply` writes the
-best 2-point set. The 3- and 4-point results use a least-squares line through
-all points (for 2 points this is exactly the library's formula).
+`--apply` writes the best `--max-points` set into `config.toml`, as the
+simulator's **Search points** button does.
+
+### Calibrating with more than two points
+
+The control program's calibration library takes exactly two points. The copy
+here is extended to up to four, with as little change as possible:
+
+- the points are `cal_points` in `config.toml` (a list of `[x, y]`), falling
+  back to `cal_point_1` / `cal_point_2` when it is absent; `cal_point_1` /
+  `cal_point_2` are still written as the first two points;
+- each receiver's `cal_distances` has one distance per point;
+- `run_full_calibration()` collects one run per point;
+- the fit is a least-squares line through all (modal tick, distance) pairs,
+  which for two points is exactly the original
+  `slope = (d1 − d2) / (t1 − t2)`, `intercept = d1 − slope · t1`.
+
+A `config.toml` with three or four points is not readable by UltraGPS-Control's
+unmodified calibration library beyond its first two points.
 
 ## Sensor model
 
@@ -204,7 +224,7 @@ ticks by inverting each receiver's true response from `sensors.toml`
 | `calibration.py` | Runs the calibration library on the simulated sensors; reads and saves offsets |
 | `cal_points.py` | Searches for the calibration points that minimise calibration error |
 | `ultragps_position/` | Copy of the positioning library (two filter changes, above) |
-| `ultragps_calibration/` | Copy of the calibration library (unmodified) |
+| `ultragps_calibration/` | Copy of the calibration library (extended to up to 4 points) |
 | `config/sensors.toml` | The simulated hardware's true tick response |
 | `simulation.py` | Run state: moves the transmitter, steps sensor + solvers, tracks error |
 | `app.py` | Matplotlib windows: simulator and calibration values |

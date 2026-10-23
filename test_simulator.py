@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from calibration import Calibrator, read_offsets  # noqa: E402
+from calibration import Calibrator, read_offsets, set_cal_points  # noqa: E402
 from sensor_model import Faults  # noqa: E402
 from simulation import Simulation  # noqa: E402
 from solvers import DEFAULT_CONFIG, DEFAULT_SENSORS  # noqa: E402
@@ -178,6 +178,35 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(scores, sorted(scores, reverse=True))   # more points, lower error
         for n in (2, 3, 4):
             self.assertEqual(len(sets[n]), n)
+
+    def test_four_point_calibration(self):
+        cfg = temp_config()
+        points = [(-97, -142), (93, 98), (93, -147), (-97, 98)]
+        set_cal_points(cfg, points)
+        saved = load_config(cfg)
+        self.assertEqual(saved["cal_points"], [list(map(float, p)) for p in points])
+        self.assertEqual(len(saved["receivers"][0]["cal_distances"]), 4)
+        sim = Simulation(cfg, seed=0)
+        sim.faults = Faults(noise_cm=0.5)
+        cal = Calibrator(sim, cfg)
+        offsets = cal.run()
+        self.assertEqual(cal.state, "done")
+        for i in range(6):
+            self.assertLess(abs(offsets[i]["slope"] / sim.sensor.slopes[i] - 1), 0.02)
+
+    def test_two_point_fit_matches_original_formula(self):
+        cfg = temp_config()
+        sim = Simulation(cfg, seed=0)
+        cal = Calibrator(sim, cfg).cal
+        for run, ticks in ((1, [300] * 6), (2, [200] * 6)):
+            for i in range(6):
+                cal.add_reading(i, ticks[i], run)
+        off = cal.calculate_offsets()
+        for i in range(6):
+            d1, d2 = cal.get_cal_distances(i)
+            slope = (d1 - d2) / (300 - 200)
+            self.assertAlmostEqual(off[i]["slope"], slope)
+            self.assertAlmostEqual(off[i]["intercept"], d1 - slope * 300)
 
 
 if __name__ == "__main__":

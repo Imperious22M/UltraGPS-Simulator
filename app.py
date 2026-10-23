@@ -7,8 +7,10 @@ UltraGPS positioning simulator — interactive window.
 Click the arena to send the transmitter somewhere, toggle receivers on and off,
 and drag the sliders to add noise and faults.  Every algorithm in the real
 positioning library solves each frame side by side, with its error against the
-true position shown live.  "Calibrate" runs the real calibration library's
-two-point routine on the simulated sensors; "Modify calibration values" opens a
+true position shown live.  "Cal points" picks how many calibration points (2-4)
+to use, "Search points" finds the best ones, "Manual selection" lets you click
+them on the arena, "Calibrate" runs the calibration library's routine on the
+simulated sensors at those points, and "Modify calibration values" opens a
 window to edit each receiver's slope and intercept.
 """
 
@@ -21,6 +23,7 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button, CheckButtons, Slider, TextBox
 
+import cal_points
 from calibration import Calibrator, read_offsets
 from simulation import Simulation
 from solvers import ALGORITHMS, DEFAULT_CONFIG, DEFAULT_SENSORS
@@ -95,6 +98,8 @@ class App:
         self.sim     = sim
         self.calib   = Calibrator(sim, config_path)
         self.editor  = None
+        self.n_points = len(self.calib.points)   # how many points Search / Manual pick
+        self.picking  = None                      # points clicked so far in manual selection
         self.paused  = False
         self.on_path = False
         self.angle   = 0.0
@@ -130,10 +135,8 @@ class App:
             ax.annotate(f"R{i}", (x, y), xytext=(0, 12), textcoords="offset points",
                         ha="center", fontsize=9)
 
-        cal = self.calib.cal
-        for k, pt in ((1, cal.cal_point_1), (2, cal.cal_point_2)):
-            ax.plot(*pt, "s", mfc="none", mec="gray", ms=9)
-            ax.annotate(f"P{k}", pt, xytext=(6, -12), textcoords="offset points", fontsize=8, color="gray")
+        self.cal_artists = []
+        self._draw_cal_points(self.calib.points)
 
         self.trail = {a: ax.plot([], [], "-", color=COLORS[a], alpha=0.4, lw=1)[0]
                       for a in ALGORITHMS}
@@ -163,7 +166,7 @@ class App:
             return s
         lib = self.sim.solvers.lib
         top = lib.max_distance if lib.max_distance is not None else lib._max_receiver_dist
-        rows = iter(0.70 - 0.03 * i for i in range(10))
+        rows = iter(0.70 - 0.028 * i for i in range(10))
         self.s_noise   = slider(next(rows), "Noise σ (cm)",         0, 20,   fl.noise_cm,           "%.1f")
         self.s_drop    = slider(next(rows), "Dropouts (%)",         0, 50,   fl.dropout_rate * 100, "%.0f")
         self.s_timeout = slider(next(rows), "Lost signal (%)",      0, 50,   fl.timeout_rate * 100, "%.0f")
@@ -174,7 +177,7 @@ class App:
         self.s_top     = slider(next(rows), "Top-band reject (cm)", 50, 1500, top,                  "%.0f")
         self.s_dt      = slider(next(rows), "Timestep (s)",      0.02, 1.0,  self.dt,               "%.2f")
 
-        y = 0.405
+        y = 0.425
         self.b_pause = Button(f.add_axes([0.64, y, 0.08, 0.04]), "Pause")
         self.b_step  = Button(f.add_axes([0.73, y, 0.08, 0.04]), "Step")
         self.b_path  = Button(f.add_axes([0.82, y, 0.08, 0.04]), "Circle path")
@@ -184,18 +187,48 @@ class App:
         self.b_path.on_clicked(self._on_path)
         self.b_reset.on_clicked(lambda _: self.sim.reset())
 
-        y = 0.355
+        y = 0.38
+        self.b_npts   = Button(f.add_axes([0.64, y, 0.10, 0.04]), f"Cal points: {self.n_points}")
+        self.b_search = Button(f.add_axes([0.75, y, 0.11, 0.04]), "Search points")
+        self.b_manual = Button(f.add_axes([0.87, y, 0.12, 0.04]), "Manual selection")
+        self.b_npts.on_clicked(self._on_npoints)
+        self.b_search.on_clicked(self._on_search)
+        self.b_manual.on_clicked(self._on_manual)
+
+        y = 0.335
         self.b_calib = Button(f.add_axes([0.64, y, 0.17, 0.04]), "Calibrate")
         self.b_edit  = Button(f.add_axes([0.82, y, 0.17, 0.04]), "Modify calibration values")
         self.b_calib.on_clicked(self._on_calibrate)
         self.b_edit.on_clicked(self._on_edit)
 
-        self.info = f.text(0.64, 0.335, "", family="monospace", fontsize=8.5, va="top")
+        self.info = f.text(0.64, 0.32, "", family="monospace", fontsize=8, va="top", linespacing=1.05)
+
+    def _draw_cal_points(self, points, pending: bool = False) -> None:
+        """Show calibration points P1..Pn on the arena (orange while picking)."""
+        for a in self.cal_artists:
+            a.remove()
+        color = "tab:orange" if pending else "dimgray"
+        self.cal_artists = []
+        for k, (x, y) in enumerate(points, start=1):
+            self.cal_artists += self.ax.plot(x, y, "s", mfc="none", mec=color, ms=10, mew=1.5)
+            self.cal_artists.append(self.ax.annotate(
+                f"P{k}", (x, y), xytext=(7, -12), textcoords="offset points", fontsize=8, color=color))
 
     # ─── Callbacks ───────────────────────────────────────────────────────────
 
     def _on_click(self, event) -> None:
-        if event.inaxes is self.ax and event.button == 1:
+        if event.inaxes is self.ax and event.button == 1 and self.picking is not None:
+            self.picking.append((event.xdata, event.ydata))
+            if len(self.picking) < self.n_points:
+                self._draw_cal_points(self.picking, pending=True)
+                self.ax.set_title(f"Manual selection: click calibration point "
+                                  f"{len(self.picking) + 1} of {self.n_points}")
+            else:
+                self._use_points(self.picking, "Manual selection")
+                self.picking = None
+                self.b_manual.label.set_text("Manual selection")
+            self.fig.canvas.draw_idle()
+        elif event.inaxes is self.ax and event.button == 1:
             self.on_path = False
             self.sim.target = np.array([event.xdata, event.ydata])
 
@@ -227,6 +260,44 @@ class App:
         if not self.paused:
             self._on_pause(None)
         self.advance()
+        self.fig.canvas.draw_idle()
+
+    def _on_npoints(self, _) -> None:
+        self.n_points = 2 if self.n_points == 4 else self.n_points + 1
+        self.b_npts.label.set_text(f"Cal points: {self.n_points}")
+        self.ax.set_title(f"{self.n_points} calibration points: use Search points or "
+                          f"Manual selection to place them")
+        self.fig.canvas.draw_idle()
+
+    def _on_search(self, _) -> None:
+        if self.calib.busy:
+            return
+        self.ax.set_title(f"Searching for the best {self.n_points} calibration points...")
+        self.fig.canvas.draw()
+        best = cal_points.search(self.sim.coords, self.n_points)[self.n_points]
+        self._use_points(best, f"Search: best {self.n_points} points")
+
+    def _on_manual(self, _) -> None:
+        if self.calib.busy:
+            return
+        if self.picking is None:
+            self.picking = []
+            self.b_manual.label.set_text("Cancel selection")
+            self.ax.set_title(f"Manual selection: click calibration point 1 of {self.n_points}")
+        else:
+            self.picking = None
+            self.b_manual.label.set_text("Manual selection")
+            self._draw_cal_points(self.calib.points)
+            self.ax.set_title("Click to move the transmitter")
+        self.fig.canvas.draw_idle()
+
+    def _use_points(self, points, how: str) -> None:
+        """Save the calibration points to config.toml and show them."""
+        self.calib.set_points(points)
+        self._draw_cal_points(self.calib.points)
+        score = cal_points.arena_score(np.asarray(points, dtype=float), self.sim.coords)
+        self.ax.set_title(f"{how}, saved to config.toml (score {score:.2f}, lower is better). "
+                          f"Press Calibrate to use them.", fontsize=9)
         self.fig.canvas.draw_idle()
 
     def _on_calibrate(self, _) -> None:

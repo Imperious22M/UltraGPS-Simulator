@@ -41,21 +41,19 @@ Check
 -----
 The best sets are then calibrated many times on the simulated sensors, with
 the same "collect until the modal tick is seen ``calibration_reads`` times"
-procedure as the calibration library, fitted by least squares (identical to
-the library's formula for 2 points), and compared with the sensors' true
-response.  The best 2-point set is also run through the real calibration
-library as a cross-check.
+procedure as the calibration library, fitted by least squares (the library's
+own fit), and compared with the sensors' true response.  The largest best set
+is also run once through the calibration library as a cross-check.
 
-``--apply`` writes the best 2-point set into config.toml (``cal_point_1``,
-``cal_point_2`` and each receiver's ``cal_distances``), because the
-calibration library supports exactly two points.
+``--apply`` writes the best ``--max-points`` set into config.toml
+(``cal_points`` and each receiver's ``cal_distances``).  The simulator's
+"Search points" button does the same.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import tempfile
 from itertools import combinations
 
@@ -64,7 +62,6 @@ import numpy as np
 from sensor_model import Faults
 from simulation import Simulation
 from solvers import DEFAULT_CONFIG, DEFAULT_SENSORS
-from ultragps_calibration import calibration as cal_lib
 from ultragps_position import load_config
 
 MAX_RANGE_CM = 400.0
@@ -200,22 +197,11 @@ def simulate(points, sim: Simulation, min_reads: int, trials: int) -> dict:
     return {"slope_pct": rms(se), "intercept_cm": rms(ie), "distance_cm": rms(de)}
 
 
-def with_points(config_path: str, points, out_path: str) -> None:
-    """Write a copy of config.toml with a 2-point calibration set."""
-    cfg = load_config(config_path)
-    p1, p2 = (list(map(float, p)) for p in points)
-    cfg["cal_point_1"], cfg["cal_point_2"] = p1, p2
-    for r in cfg["receivers"]:
-        pos = np.array(r["position"], dtype=float)
-        r["cal_distances"] = [float(np.linalg.norm(pos - p1)), float(np.linalg.norm(pos - p2))]
-    cal_lib._write_config(out_path, cfg)
-
-
 def library_check(points, config_path: str, noise: float, seed: int) -> dict:
-    """Run the real calibration library once at a 2-point set; return errors."""
-    from calibration import Calibrator
+    """Run the calibration library once at a point set; return errors."""
+    from calibration import Calibrator, set_cal_points
     tmp = os.path.join(tempfile.mkdtemp(), "config.toml")
-    with_points(config_path, points, tmp)
+    set_cal_points(config_path, points, tmp)
     sim = Simulation(tmp, seed=seed)
     sim.faults = Faults(noise_cm=noise)
     off = Calibrator(sim, tmp).run()
@@ -236,7 +222,7 @@ def main() -> None:
     p.add_argument("--trials", type=int, default=200, help="simulated calibrations per set")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--apply", action="store_true",
-                   help="write the best 2-point set into --config")
+                   help="write the best --max-points set into --config")
     p.add_argument("--plot", default="cal_points.png", help="save a plot here ('' to skip)")
     args = p.parse_args()
 
@@ -244,7 +230,8 @@ def main() -> None:
     sim.faults = Faults(noise_cm=args.noise)
     cfg = load_config(args.config)
     min_reads = int(cfg.get("calibration_reads", 5))
-    sets = {"current": np.array([cfg["cal_point_1"], cfg["cal_point_2"]], dtype=float)}
+    current = cfg.get("cal_points", [cfg["cal_point_1"], cfg["cal_point_2"]])
+    sets = {"current": np.array(current, dtype=float)}
     for n, pts in search(sim.coords, args.max_points, args.margin).items():
         sets[f"best {n}"] = pts
 
@@ -266,13 +253,15 @@ def main() -> None:
         print(f"  {name}: " + "  ".join(f"R{i} {s / cs:.2f}/{c / cc:.2f}"
                                         for i, ((s, c), (cs, cc)) in enumerate(zip(e, cur))))
 
-    lib = library_check(sets["best 2"], args.config, args.noise, args.seed)
-    print("\nBest 2-point set through the real calibration library (one run): "
+    best = f"best {args.max_points}"
+    lib = library_check(sets[best], args.config, args.noise, args.seed)
+    print(f"\n{best} through the calibration library (one run): "
           + "  ".join(f"R{i} {s:+.1f}%/{c:+.1f}cm" for i, (s, c) in lib.items()))
 
     if args.apply:
-        with_points(args.config, sets["best 2"], args.config)
-        print(f"\nWrote the best 2-point set to {args.config}")
+        from calibration import set_cal_points
+        set_cal_points(args.config, sets[best])
+        print(f"\nWrote the {best} set to {args.config}")
 
     if args.plot:
         import matplotlib
