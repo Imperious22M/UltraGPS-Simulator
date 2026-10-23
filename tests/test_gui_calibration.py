@@ -332,10 +332,11 @@ class MapWindowTest(unittest.TestCase):
         data = self.compute("bias", 40)
         self.win.show_btn.click()
         self.win.clear_btn.click()
-        _, _, Z, title, vmin, vmax = sent[0]
+        _, _, Z, title, vmin, vmax, levels = sent[0]
         self.assertIs(Z, data.Z)
         self.assertIn("cm", title)
         self.assertLess(vmin, vmax)
+        self.assertEqual(levels, data.levels)                       # the arena draws the same contours
         self.assertIsNone(sent[1])
 
     def test_wait_says_when_the_computation_has_ended(self):

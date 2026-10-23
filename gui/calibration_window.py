@@ -3,13 +3,16 @@ Calibration window — calibrating each receiver's tick → distance conversion
 on the simulated sensors, in four steps, top left to bottom right:
 
 1. Points: choose 2 to 4 calibration points by searching for the best set
-   (``engine.cal_points``), picking them on the arena, or typing them.  The
-   score is the calibration error the set causes over the arena.
+   (``engine.cal_points``, in the current room), picking them on the arena,
+   or typing them.  The score is the calibration error the set causes over
+   the arena.  Points outside the walls, inside an obstacle or on top of each
+   other are refused; a receiver that can't see a point is marked.
 2. Run: the calibration library collects pings at each point in turn, with
    the current physics, faults and receiver states, fits each receiver's line
-   and writes it to config.toml.
-3. Offsets: each receiver's slope and intercept next to its true response,
-   with the distance error they cause; edit, save, reload, or use the truth.
+   and writes it to config.toml.  A run can be cancelled.
+3. Offsets: each receiver's slope and intercept next to its true response in
+   the current air (``engine.calibration.effective_true``), with the distance
+   error they cause; edit, save, reload, or use the truth.
 4. Response: one receiver's tick → distance line, true and calibrated, the
    modal tick it read at each calibration point, and the error between the
    lines, so a slope or intercept error (or a point heard as an echo) shows.
@@ -17,6 +20,7 @@ on the simulated sensors, in four steps, top left to bottom right:
 
 from __future__ import annotations
 
+import copy
 import html
 import math
 from contextlib import nullcontext
@@ -25,25 +29,27 @@ import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
-                             QLabel, QMainWindow, QProgressBar, QPushButton, QScrollArea, QSpinBox,
-                             QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                             QLabel, QMainWindow, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+                             QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from engine import cal_points
-from engine.calibration import read_offsets
+from engine.calibration import effective_true, read_offsets
 from gui import draw, theme
 from gui.charts import nice_step
 from gui.theme import color
 
-ERROR_AT  = (100.0, 300.0)        # distances the offsets table reports the error at, cm
-GOOD_CM   = 1.0                   # |error| up to this is drawn green, up to FAIR_CM amber, beyond red
-FAIR_CM   = 3.0
-PLOT_MAX  = 500.0                 # the response plot covers 0 .. this many cm
-ROW_PX    = 24                    # table row height
-SCORE_TIP = ("Arena score of the points: the RMS distance error their calibration causes over the "
-             "whole arena and every receiver, per cm of error in a single reading "
-             "(sqrt(1/n + (D − d̄)²/Sxx), see engine/cal_points.py). Lower is better. It depends "
-             "only on geometry: a receiver wants its points at very different distances from it, "
-             "centred on the distances it will measure.")
+ERROR_AT     = (100.0, 300.0)     # distances the offsets table reports the error at, cm
+GOOD_CM      = 1.0                # |error| up to this is drawn green, up to FAIR_CM amber, beyond red
+FAIR_CM      = 3.0
+PLOT_MAX     = 500.0              # the response plot covers 0 .. this many cm
+SPREAD_CM    = 10.0               # a receiver whose points are closer together than this gets a poor slope
+MAX_COORD_CM = 1e5                # a typed point farther out than this is refused (1 km: a typo)
+ROW_PX       = 24                 # table row height
+SCORE_TIP    = ("Arena score of the points: the RMS distance error their calibration causes over the "
+                "whole arena and every receiver, per cm of error in a single reading "
+                "(sqrt(1/n + (D − d̄)²/Sxx), see engine/cal_points.py). Lower is better. It depends "
+                "only on geometry: a receiver wants its points at very different distances from it, "
+                "centred on the distances it will measure.")
 
 
 def error_colour(err: float) -> str:
@@ -64,23 +70,31 @@ def calibration_error(true: tuple, cal: tuple, d: float) -> float:
 # ─── Background search ───────────────────────────────────────────────────────
 
 class SearchJob(QThread):
-    """``engine.cal_points.search`` for one point count, off the GUI thread."""
+    """``engine.cal_points.search`` for one point count, off the GUI thread,
+    in copies of the room and the receivers (for walls and line of sight)."""
 
-    found = pyqtSignal(object)            # (n, 2) array of points
+    found  = pyqtSignal(object)           # (n, 2) array of points
+    failed = pyqtSignal(str)              # why no set was found
 
-    def __init__(self, coords, n: int, parent=None):
+    def __init__(self, coords, n: int, world=None, receivers=None, parent=None):
         super().__init__(parent)
         self.coords, self.n = np.array(coords, dtype=float), n
+        self.world, self.receivers = world, receivers
 
     def run(self) -> None:
-        self.found.emit(cal_points.search(self.coords, self.n)[self.n])
+        try:
+            self.found.emit(cal_points.search(self.coords, self.n, world=self.world,
+                                              receivers=self.receivers)[self.n])
+        except Exception as exc:          # an exception escaping QThread.run aborts the whole app
+            self.failed.emit(str(exc) or type(exc).__name__)
 
 
 # ─── Canvases ────────────────────────────────────────────────────────────────
 
 class PointsView(QWidget):
     """Small plan of the arena: receivers, walls, obstacles, the points in
-    use (dim) and the points being edited (accent)."""
+    use (dim), the points being edited (accent), and a dashed line from each
+    edited point to every receiver that is on but can't see it."""
 
     def __init__(self, sim, parent=None):
         super().__init__(parent)
@@ -90,7 +104,9 @@ class PointsView(QWidget):
         self.view    = draw.View()
         self.setMinimumSize(200, 150)
         self.setToolTip("Where the calibration points are: bright squares are the points listed "
-                        "above, dim squares the ones in config.toml when they differ")
+                        "above, dim squares the ones in config.toml when they differ. A dashed red "
+                        "line joins a point to a receiver that can't see it: that receiver would "
+                        "calibrate on an echo there")
 
     def set_points(self, edited, in_use) -> None:
         self.edited = [tuple(map(float, q)) for q in edited]
@@ -115,6 +131,12 @@ class PointsView(QWidget):
         for q in self.in_use:
             if q not in self.edited:
                 draw.marker(p, v.px(*q), "square", pal.text_muted, 7.0, 1.0)
+        for q, row in zip(self.edited, cal_points.unseen(self.edited, world, self.sim.receivers)):
+            if not world.inside(q) or any(o.contains(q) for o in world.obstacles):
+                continue                  # refused anyway: no point in saying who can't see it
+            for r in (r for r, hidden in zip(self.sim.receivers, row) if hidden):
+                draw.stroke(p, draw.polyline_path([v.px(*q), v.px(*r.position)]), pal.status["lost"], 1.1,
+                            0.85, draw.DASH, glow=False)
         for k, q in enumerate(self.edited):
             c = v.px(*q)
             draw.marker(p, c, "square", pal.accent, 8.0, 1.3, fill=0.25)
@@ -135,10 +157,11 @@ class ResponsePlot(QWidget):
         self.true     = (1.0, 0.0)
         self.cal      = (1.0, 0.0)
         self.points: list = []            # [(label, tick, known distance, note)]; a note marks a doubtful point
+        self.air      = ""                # the air the true response is for, when not the calibration air
         self.setMinimumSize(300, 220)
 
-    def set_data(self, receiver: int, true: tuple, cal: tuple, points: list) -> None:
-        self.receiver, self.true, self.cal, self.points = receiver, true, cal, points
+    def set_data(self, receiver: int, true: tuple, cal: tuple, points: list, air: str = "") -> None:
+        self.receiver, self.true, self.cal, self.points, self.air = receiver, true, cal, points, air
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -191,11 +214,21 @@ class ResponsePlot(QWidget):
             draw.marker(p, QPointF(X(t), Ye(e)), "circle", error_colour(e), 6.0, 1.3)
             self._note(p, QPointF(X(t), bottom.top() + 8 + 12 * k), f"{e:+.1f} cm at {d:.0f}", error_colour(e),
                        bold=False)
+        groups = []                       # [anchor, [(label, note)]]: points too close to label apart
         for (lab, t, d, note), r in zip(self.points, res):
             c = pal.status["echo"] if note else pal.text
             for q in (QPointF(X(t), Yd(d)), QPointF(X(t), Ye(r))):
                 draw.marker(p, q, "square", c, 7.0, 1.2, fill=0.3)
-            self._note(p, QPointF(X(t), Yd(d) - 9), f"{lab} {note}".strip(), c)
+            at = QPointF(X(t), Yd(d) - 9)
+            for g in groups:
+                if abs(g[0].x() - at.x()) < 10 and abs(g[0].y() - at.y()) < 10:
+                    g[1].append((lab, note))
+                    break
+            else:
+                groups.append([at, [(lab, note)]])
+        for at, items in groups:
+            c = pal.status["echo"] if any(note for _, note in items) else pal.text
+            self._note(p, at, _merged_labels(items), c)
         self._legend(p)
 
     def _note(self, p, at: QPointF, text: str, c: str, bold: bool = True) -> None:
@@ -238,7 +271,8 @@ class ResponsePlot(QWidget):
     def _legend(self, p) -> None:
         """One row under the title, clear of the data."""
         pal   = theme.current
-        items = [("true response", pal.truth, None), ("calibrated", pal.accent, draw.DASH)]
+        true  = f"true response at {self.air}" if self.air else "true response"
+        items = [(true, pal.truth, None), ("calibrated", pal.accent, draw.DASH)]
         if self.points:
             items.append(("modal tick at a point", pal.text, "square"))
         x, y = float(self.LEFT), 28.0
@@ -268,8 +302,9 @@ class CalibrationWindow(QMainWindow):
         self._points    = [list(q) for q in self._in_use]
         self._offsets   = {i: dict(o) for i, o in self._saved.items()}
         self._run_points: list | None = None      # the points of the last run started here
-        self._seen      = (None, None, None)      # (state, version, palette) last shown
+        self._seen      = (None, None, None, None)   # (state, version, palette, scene) last shown
         self._filling   = False                   # tables being filled by code, not edited
+        self._problems: list = []                 # why the table's points can't be calibrated on
         self.setWindowTitle("Calibration")
         self.resize(1180, 800)
 
@@ -319,12 +354,14 @@ class CalibrationWindow(QMainWindow):
                               "but take longer to collect")
         self.search_btn = QPushButton("Search best points")
         self.search_btn.setToolTip("Find the set of this many points with the lowest arena score "
-                                   "(engine/cal_points.py)")
+                                   "(engine/cal_points.py), among the points inside the walls and "
+                                   "outside the obstacles, in the line of sight of every receiver that "
+                                   "is on wherever the room allows")
         self.pick_btn = QPushButton("Pick on arena")
         self.pick_btn.setToolTip("Click this many points on the main window's arena")
         self.points_table = _table(0, ["x cm", "y cm"], "The calibration points; double-click a value "
                                                           "to edit it")       # columns: label, x, y
-        self.score = QLabel()
+        self.score = _wrapping_label()
         self.score.setToolTip(SCORE_TIP)
         self.preview = PointsView(self.sim)
         self.use_btn = QPushButton("Use these points")
@@ -349,7 +386,7 @@ class CalibrationWindow(QMainWindow):
         self.pick_btn.clicked.connect(lambda: self.pickRequested.emit(self.count.value()))
         self.points_table.itemChanged.connect(self._on_point_edited)
         self.use_btn.clicked.connect(self.use_points)
-        self.revert_btn.clicked.connect(lambda: self.set_points(self._in_use))
+        self.revert_btn.clicked.connect(self.revert_points)
         return box
 
     def _build_run_box(self) -> QGroupBox:
@@ -358,30 +395,34 @@ class CalibrationWindow(QMainWindow):
         self.calibrate_btn.setToolTip("Run the calibration library at the points above (writing them "
                                       "to config.toml first if you changed them), then save and apply "
                                       "the offsets")
-        self.state = QLabel()
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Stop the calibration run: config.toml keeps the offsets it had, and "
+                                   "the simulation carries on")
+        self.state = _wrapping_label()
         self.state.setFont(theme.mono_font(9, bold=True))
         self.run_bar = QProgressBar()
         self.run_bar.setRange(0, 1000)
         self.run_bar.setToolTip("Readings collected: a point is done once every receiver has read its "
                                 "most frequent tick calibration_reads times")
-        self.run_detail = QLabel()
+        self.run_detail = _wrapping_label()
         self.run_detail.setFont(theme.mono_font(8.5))
         self.run_detail.setProperty("role", "dim")
-        self.run_detail.setWordWrap(True)
         note = QLabel("The calibration pings the simulated sensors with the current physics, faults "
                       "and receiver states: noise and range walk shift the modal ticks, and a "
                       "receiver without line of sight to a point calibrates on an echo. The "
-                      "simulation waits while it runs.")
+                      f"simulation waits while it runs, then resumes its drive; a run gives up after "
+                      f"{self.calibrator.timeout_s:g} s.")
         note.setWordWrap(True)
         note.setProperty("role", "muted")
         g = QGridLayout(box)
         g.addWidget(self.calibrate_btn, 0, 0)
-        g.addWidget(self.state, 0, 1)
-        g.addWidget(self.run_bar, 1, 0, 1, 2)
-        g.addWidget(self.run_detail, 2, 0, 1, 2)
-        g.addWidget(note, 3, 0, 1, 2)
-        g.setColumnStretch(1, 1)
+        g.addWidget(self.cancel_btn, 0, 1)
+        g.addWidget(self.state, 1, 0, 1, 2)
+        g.addWidget(self.run_bar, 2, 0, 1, 2)
+        g.addWidget(self.run_detail, 3, 0, 1, 2)
+        g.addWidget(note, 4, 0, 1, 2)
         self.calibrate_btn.clicked.connect(self.calibrate)
+        self.cancel_btn.clicked.connect(self.calibrator.cancel)
         return box
 
     def _build_offsets_box(self) -> QGroupBox:
@@ -431,11 +472,11 @@ class CalibrationWindow(QMainWindow):
             self.receiver.addItem(f"R{r.id}", r.id)
         self.receiver.setToolTip("The receiver to plot (or click its row in the table)")
         self.plot = ResponsePlot()
-        self.plot.setToolTip("Top: tick against distance, the sensor's true line (sensors.toml) and "
-                             "the calibrated one (config.toml). Bottom: the distance error between "
-                             "them; a slope error tilts it, an intercept error shifts it. Squares: the "
-                             "modal tick read at each calibration point in the last run, against the "
-                             "point's known distance.")
+        self.plot.setToolTip("Top: tick against distance, the sensor's true line (sensors.toml, in the "
+                             "current air) and the calibrated one (config.toml). Bottom: the distance "
+                             "error between them; a slope error tilts it, an intercept error shifts it. "
+                             "Squares: the modal tick read at each calibration point in the last run, "
+                             "against the point's known distance.")
         head = QHBoxLayout()
         lab_ = QLabel("Receiver")
         lab_.setProperty("role", "dim")
@@ -459,66 +500,153 @@ class CalibrationWindow(QMainWindow):
         4; with fewer than 2, one is added in the middle of the receivers)."""
         self._resize_points([[float(x), float(y)] for x, y in points], min(max(len(points), 2), 4))
 
+    def revert_points(self) -> None:
+        """Back to the points in config.toml (the arena drops any picked ones)."""
+        self.set_points(self._in_use)
+        self.pointsChanged.emit(self.points())
+
     def _on_count(self, n: int) -> None:
         """Drop points, or add new ones in the middle of the receivers to edit."""
         self._resize_points(self._points, n)
 
     def _resize_points(self, points: list, n: int) -> None:
-        """Show the first ``n`` of ``points``, adding points in the middle of the receivers if short."""
+        """Show the first ``n`` of ``points``, adding points in the middle of the
+        receivers if short (40 cm apart, not one point twice)."""
         centre = (self.sim.believed.min(axis=0) + self.sim.believed.max(axis=0)) / 2
         self._points = [list(q) for q in points[:n]]
-        while len(self._points) < n:
-            self._points.append([float(centre[0]), float(centre[1])])
+        for k in range(n - len(self._points)):
+            self._points.append([float(centre[0]), float(centre[1]) + 40.0 * k])
         self.count.blockSignals(True)
         self.count.setValue(n)
         self.count.blockSignals(False)
         self._fill_points()
 
+    def _check_points(self) -> tuple[list, list, list]:
+        """``(problems, warnings, rows)`` for the table's points: why they can't
+        be calibrated on, what will go wrong if they are, and each point's own
+        ``(problems, warnings)`` for its row."""
+        pts   = np.array(self._points, dtype=float).reshape(-1, 2)
+        world = self.sim.world
+        rxs   = self.sim.receivers
+        rows  = [([], []) for _ in pts]
+        for k, q in enumerate(pts):
+            if not world.inside(q):
+                rows[k][0].append("outside the walls")
+            elif any(o.contains(q) for o in world.obstacles):
+                rows[k][0].append("inside an obstacle")
+        problems  = [f"P{k + 1} is {bad[0]}" for k, (bad, _) in enumerate(rows) if bad]
+        reachable = np.array([not bad for bad, _ in rows], dtype=bool)
+        close     = cal_points.too_close(pts)
+        for i, j, d in close:
+            problems.append(f"P{i + 1} and P{j + 1} are only {d:.1f} cm apart "
+                            f"(keep them {cal_points.MIN_SEPARATION_CM:g} cm or more apart)")
+            rows[i][0].append(f"{d:.1f} cm from P{j + 1}")
+            rows[j][0].append(f"{d:.1f} cm from P{i + 1}")
+        dist = np.linalg.norm(pts[:, None, :] - self.sim.believed[None, :, :], axis=2)    # (point, receiver)
+        flat = ((dist - dist.mean(axis=0)) ** 2).sum(axis=0) <= 1e-9                      # as in the score
+        if flat.any() and not close:
+            names = [f"R{r.id}" for r, f in zip(rxs, flat) if f]
+            problems.append(f"{', '.join(names)} {'is' if len(names) == 1 else 'are'} the same distance from "
+                            f"every point: no slope can be fitted")
+
+        # What a point the transmitter can be at will get wrong
+        warnings = []
+        for k in np.flatnonzero(reachable):
+            far = int(np.argmax(dist[k]))
+            if dist[k, far] > cal_points.MAX_RANGE_CM:
+                rows[k][1].append(f"R{rxs[far].id} is {dist[k, far]:.0f} cm away, beyond the HC-SR04's "
+                                  f"{cal_points.MAX_RANGE_CM:.0f} cm range")
+        beyond = [f"P{k + 1}" for k, (_, warn) in enumerate(rows) if warn]
+        if beyond:
+            warnings.append(f"{', '.join(beyond)} out of a receiver's {cal_points.MAX_RANGE_CM:.0f} cm range")
+        hidden = cal_points.unseen(pts, world, rxs) & reachable[:, None]
+        for k in range(len(pts)):
+            names = [f"R{r.id}" for r, h in zip(rxs, hidden[k]) if h]
+            if names:
+                rows[k][1].append(f"{', '.join(names)} can't see it and would calibrate on an echo")
+        pairs = [f"P{k + 1}–R{rxs[i].id}" for k, i in zip(*np.nonzero(hidden))]
+        if pairs:
+            warnings.append(f"No line of sight {', '.join(pairs)}: those receivers would calibrate on an echo")
+        narrow = [f"R{r.id}" for r, s, f in zip(rxs, np.ptp(dist, axis=0), flat) if s < SPREAD_CM and not f]
+        if narrow and not close:
+            warnings.append(f"{', '.join(narrow)}: the points' distances differ by under {SPREAD_CM:g} cm, "
+                            f"a poor slope")
+        return problems, warnings, rows
+
     def _fill_points(self) -> None:
         pal, t = theme.current, self.points_table
+        check  = self._check_points()
         self._filling = True
         t.setRowCount(len(self._points))
-        for k, (x, y) in enumerate(self._points):
-            far = np.linalg.norm(self.sim.believed - np.array([x, y]), axis=1)
-            out = far.max() > cal_points.MAX_RANGE_CM
-            tip = (f"R{int(np.argmax(far))} is {far.max():.0f} cm away: beyond the HC-SR04's "
-                   f"{cal_points.MAX_RANGE_CM:.0f} cm range" if out else "Double-click to edit")
+        for k, ((x, y), (bad, warn)) in enumerate(zip(self._points, check[2])):
+            c   = pal.status["lost"] if bad else pal.status["near"] if warn else pal.text
+            tip = f"P{k + 1}: " + "; ".join(bad + warn) if bad or warn else "Double-click to edit"
             t.setItem(k, 0, _row_label(f"P{k + 1}"))
-            for c, value in enumerate((x, y)):
-                t.setItem(k, c + 1, _item(f"{value:.1f}", pal.status["range"] if out else pal.text, tip=tip))
+            for col, value in enumerate((x, y)):
+                t.setItem(k, col + 1, _item(f"{value:.1f}", c, tip=tip))
         _fit_rows(t)
         self._filling = False
-        self._update_score()
+        self._update_score(check)
 
     def _on_point_edited(self, item: QTableWidgetItem) -> None:
         if self._filling or item.column() == 0:
             return
         value = _number(item.text())
-        if value is not None:
+        if value is not None and abs(value) <= MAX_COORD_CM:
             self._points[item.row()][item.column() - 1] = value
         self._fill_points()               # not a number: puts the old value back
 
-    def _update_score(self) -> None:
-        coords = self.sim.believed
-        in_use = self._in_use
-        same   = len(in_use) == len(self._points) and np.allclose(in_use, self._points)
-        text   = f"Arena score {cal_points.arena_score(self._points, coords):.3f}"
-        self.score.setText(text + ("   (in use)" if same else
-                                   f"   in use {cal_points.arena_score(in_use, coords):.3f}   lower is better"))
+    def _same_points(self) -> bool:
+        """Are the table's points the ones in config.toml?"""
+        return len(self._in_use) == len(self._points) and np.allclose(self._in_use, self._points)
+
+    def _update_score(self, check: tuple | None = None) -> None:
+        pal, coords, in_use = theme.current, self.sim.believed, self._in_use
+        problems, warnings, _ = check or self._check_points()
+        same  = self._same_points()
+        text  = f"Arena score {cal_points.arena_score(self._points, coords):.3f}"
+        text += (" (in use)" if same else
+                 f" · in use {cal_points.arena_score(in_use, coords):.3f} · lower is better")
+        lines = [html.escape(text)] + [_coloured(w, pal.status["near"]) for w in warnings]
+        if problems:
+            lines.append(_coloured("Can't use these points: " + "; ".join(problems), pal.status["lost"]))
+        self.score.setText("<br>".join(lines))
+        self.score.setToolTip(SCORE_TIP + "".join(f"\n\n{x}" for x in problems + warnings))
         self.preview.set_points(self._points, in_use)
-        self.use_btn.setEnabled(not same and not self.calibrator.busy)
+        self._problems = problems
+        self._update_buttons()
         self.revert_btn.setEnabled(not same)
 
+    def _update_buttons(self, busy: bool | None = None) -> None:
+        """Nothing that writes config.toml while a run is going, and no
+        calibration on points that can't be calibrated on."""
+        busy = self.calibrator.busy if busy is None else busy
+        ok   = not self._problems
+        self.use_btn.setEnabled(ok and not busy and not self._same_points())
+        self.calibrate_btn.setEnabled(ok and not busy)
+        self.cancel_btn.setEnabled(busy)
+        for w in (self.save_btn, self.reload_btn):
+            w.setEnabled(not busy)
+
     def search(self) -> None:
-        """Find the best set of ``count`` points on a background thread."""
+        """Find the best set of ``count`` points on a background thread, in
+        copies of the room and the receivers as they are now."""
         if self.search_job is not None:
             return
+        with self.lock:
+            world, receivers = copy.deepcopy(self.sim.world), copy.deepcopy(self.sim.receivers)
         self.search_btn.setEnabled(False)
         self.search_btn.setText("Searching...")
-        self.search_job = SearchJob(self.sim.believed, self.count.value(), self)
+        self.search_job = SearchJob(self.sim.believed, self.count.value(), world, receivers, self)
         self.search_job.found.connect(self.set_points)
+        self.search_job.failed.connect(self._search_failed)
         self.search_job.finished.connect(self._search_done)
         self.search_job.start()
+
+    def _search_failed(self, why: str) -> None:
+        text = f"Search found no set: {why}"
+        self.score.setText(_coloured(text, theme.current.status["lost"]))
+        self.statusBar().showMessage(text, 10000)
 
     def _search_done(self) -> None:
         self.search_job.deleteLater()
@@ -526,17 +654,23 @@ class CalibrationWindow(QMainWindow):
         self.search_btn.setEnabled(True)
         self.search_btn.setText("Search best points")
 
-    def use_points(self) -> None:
-        """Write the table's points to config.toml and tell the arena."""
+    def use_points(self) -> bool:
+        """Write the table's points to config.toml and tell the arena; false
+        if they can't be used (see ``_check_points``) or a run is going."""
+        problems = self._check_points()[0]
+        if problems:
+            self.statusBar().showMessage("Can't use these points: " + "; ".join(problems), 8000)
+            return False
         try:
             self.calibrator.set_points(self._points)
         except RuntimeError as exc:
             self.statusBar().showMessage(str(exc), 4000)
-            return
+            return False
         self._read_config()
         self.pointsChanged.emit(self.points())
         self._update_score()
         self.statusBar().showMessage("Calibration points written to config.toml", 4000)
+        return True
 
     # ─── 2. Run ──────────────────────────────────────────────────────────────
 
@@ -544,8 +678,12 @@ class CalibrationWindow(QMainWindow):
         """Start a calibration run at the table's points."""
         if self.calibrator.busy:
             return
-        if self._points != self._in_use:
-            self.use_points()
+        if self._points != self._in_use and not self.use_points():
+            return
+        problems = self._check_points()[0]          # the points in config.toml may be bad too
+        if problems:
+            self.statusBar().showMessage("Can't calibrate on these points: " + "; ".join(problems), 8000)
+            return
         self._run_points = [list(q) for q in self._in_use]
         with self.lock:
             self.calibrator.start()
@@ -553,15 +691,17 @@ class CalibrationWindow(QMainWindow):
 
     def poll(self) -> None:
         """Follow the calibrator: progress while it runs, the points and offsets
-        in config.toml once it is not running (see ``_read_config``)."""
+        in config.toml once it is not running (see ``_read_config``); and the
+        air, room and receiver states the table's colours depend on."""
         c     = self.calibrator
         state = c.state                          # once: the run's thread changes it
         busy  = state.startswith("run")
+        scene = self._scene_key()
         if busy:
             self._show_progress(int(state.split()[1]))
-            now = (state, self._seen[1], theme.current.name)   # new offsets show once it is done
+            now = (state, self._seen[1], theme.current.name, scene)   # new offsets show once it is done
         else:
-            now = (state, c.version, theme.current.name)
+            now = (state, c.version, theme.current.name, scene)
             if now[:2] != self._seen[:2]:
                 self._read_config()
             if now[1] != self._seen[1]:
@@ -572,6 +712,13 @@ class CalibrationWindow(QMainWindow):
         self._fill_points()
         self._fill_offsets()
         self._show_state(state)
+
+    def _scene_key(self) -> tuple:
+        """The air, walls, obstacles and receivers, as far as the tables show them."""
+        e, w = self.sim.env, self.sim.world
+        return ((e.temperature_c, e.humidity_pct, e.cal_temperature_c, e.cal_humidity_pct),
+                tuple(map(tuple, w.walls)), tuple(tuple(map(tuple, o.points)) for o in w.obstacles),
+                tuple((r.state, tuple(r.position)) for r in self.sim.receivers))
 
     def _read_config(self) -> None:
         """Remember the points, offsets and reads per point in config.toml.
@@ -585,13 +732,16 @@ class CalibrationWindow(QMainWindow):
     def _show_state(self, state: str) -> None:
         c, pal = self.calibrator, theme.current
         busy   = state.startswith("run")
-        for w in (self.calibrate_btn, self.save_btn, self.reload_btn):
-            w.setEnabled(not busy)
-        text, col = {"idle":  ("not run yet", pal.text_dim),
-                     "done":  ("done: offsets saved and applied", pal.status["ok"]),
-                     "error": (f"error: {c.error}", pal.status["lost"])}.get(
-                         state, (f"collecting at P{state.split()[-1]}", pal.accent))
+        self._update_buttons(busy)
+        if state == "error" and c.error == "cancelled":
+            text, col = "cancelled: config.toml keeps the offsets it had", pal.status["near"]
+        else:
+            text, col = {"idle":  ("not run yet", pal.text_dim),
+                         "done":  ("done: offsets saved and applied", pal.status["ok"]),
+                         "error": (f"error: {c.error}", pal.status["lost"])}.get(
+                             state, (f"collecting at P{state.split()[-1]}", pal.accent))
         self.state.setText(_coloured(text, col))
+        self.state.setToolTip(text)
         if state == "done":
             self.run_bar.setValue(1000)
             self.run_detail.setText(self._run_summary())
@@ -604,7 +754,7 @@ class CalibrationWindow(QMainWindow):
         pal, c  = theme.current, self.calibrator
         skipped = [f"R{r.id}" for r in self.sim.receivers if r.id not in c.offsets]
         bad     = [f"R{r.id}" for r in self.sim.receivers if r.id in c.offsets and max(
-                   abs(calibration_error((r.slope, r.intercept), (c.offsets[r.id]["slope"],
+                   abs(calibration_error(self._true(r), (c.offsets[r.id]["slope"],
                        c.offsets[r.id]["intercept"]), d)) for d in ERROR_AT) > FAIR_CM]
         lines = []
         if skipped:
@@ -637,13 +787,49 @@ class CalibrationWindow(QMainWindow):
         """The slopes and intercepts in the table ``{id: {"slope", "intercept"}}``."""
         return {i: dict(o) for i, o in self._offsets.items()}
 
+    def _true(self, r) -> tuple[float, float]:
+        """Receiver ``r``'s true (slope, intercept) in the current air."""
+        return effective_true(r, self.sim.env)
+
+    def _air(self) -> str:
+        """The current air when it is not the calibration air ("" when it is)."""
+        e = self.sim.env
+        if (e.temperature_c, e.humidity_pct) == (e.cal_temperature_c, e.cal_humidity_pct):
+            return ""
+        return f"{e.temperature_c:g} °C" + ("" if e.humidity_pct == e.cal_humidity_pct else
+                                            f" {e.humidity_pct:g} %RH")
+
+    def _label_air(self, air: str) -> None:
+        """Say which air the true columns, the errors and "Use true values" are for."""
+        t, e = self.offsets_table, self.sim.env
+        why  = ("The sensors convert echo time to distance with the speed of sound of the air they were "
+                f"calibrated in ({e.cal_temperature_c:g} °C, {e.cal_humidity_pct:g} %RH), so their true "
+                "response scales by c(now) / c(calibration)")
+        for col, name in ((3, "slope"), (4, "intercept")):
+            t.horizontalHeaderItem(col).setText(f"true {name}\nat {air}" if air else f"true\n{name}")
+            t.horizontalHeaderItem(col).setToolTip(
+                f"The simulated sensor's real {name} in the current air ({air}): sensors.toml's, scaled. "
+                f"{why}" if air else f"The simulated sensor's real {name} (sensors.toml), in the "
+                f"calibration air. {why}")
+        for col, d in enumerate(ERROR_AT, start=5):
+            t.horizontalHeaderItem(col).setToolTip(
+                f"Distance error the calibration causes at a true {d:.0f} cm in the current air: the tick "
+                f"the sensor gives there, converted with the calibrated slope and intercept, minus {d:.0f} "
+                f"cm. Green within {GOOD_CM:g} cm, amber within {FAIR_CM:g} cm, red beyond")
+        self.true_btn.setToolTip(f"Fill in each sensor's true response in the current air ({air}): a perfect "
+                                 f"calibration for this air, not for {e.cal_temperature_c:g} °C. Press Save "
+                                 f"& apply to use it" if air else
+                                 "Fill in each sensor's true response (a perfect calibration); press Save & "
+                                 "apply to use it")
+
     def _fill_offsets(self) -> None:
         """Columns: receiver, slope, intercept (editable), true slope, true intercept, errors."""
         pal, t = theme.current, self.offsets_table
+        self._label_air(self._air())
         self._filling = True
         for row, r in enumerate(self.sim.receivers):
             o    = self._offsets[r.id]
-            true = (r.slope, r.intercept)
+            true = self._true(r)
             cal  = (o["slope"], o["intercept"])
             cells = [(f"{cal[0]:.5f}", pal.text), (f"{cal[1]:.3f}", pal.text),
                      (f"{true[0]:.5f}", pal.text_dim), (f"{true[1]:.3f}", pal.text_dim)]
@@ -688,8 +874,8 @@ class CalibrationWindow(QMainWindow):
         self._fill_offsets()
 
     def use_true_values(self) -> None:
-        """Fill the table with each sensor's true response (not saved yet)."""
-        self._offsets = {r.id: {"slope": r.slope, "intercept": r.intercept} for r in self.sim.receivers}
+        """Fill the table with each sensor's true response in the current air (not saved yet)."""
+        self._offsets = {r.id: dict(zip(("slope", "intercept"), self._true(r))) for r in self.sim.receivers}
         self._fill_offsets()
 
     # ─── 4. Plot ─────────────────────────────────────────────────────────────
@@ -698,7 +884,7 @@ class CalibrationWindow(QMainWindow):
         row = max(self.receiver.currentIndex(), 0)
         r   = self.sim.receivers[row]
         o   = self._offsets[r.id]
-        self.plot.set_data(r.id, (r.slope, r.intercept), (o["slope"], o["intercept"]), self._run_ticks(row))
+        self.plot.set_data(r.id, self._true(r), (o["slope"], o["intercept"]), self._run_ticks(row), self._air())
 
     def _run_ticks(self, row: int) -> list:
         """``[(label, modal tick, known distance, note)]`` of the receiver in
@@ -781,6 +967,22 @@ def _number(text: str) -> float | None:
     except ValueError:
         return None
     return value if math.isfinite(value) else None
+
+
+def _wrapping_label() -> QLabel:
+    """A label that wraps its text and never widens its column (a long path
+    in an error message would otherwise push the controls out of view)."""
+    label = QLabel()
+    label.setWordWrap(True)
+    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+    return label
+
+
+def _merged_labels(items: list) -> str:
+    """One label for points drawn on top of each other: ``P2, P3 no line of
+    sight``, with `` · `` between points with different notes."""
+    notes = list(dict.fromkeys(note for _, note in items))
+    return " · ".join(f"{', '.join(lab for lab, n in items if n == note)} {note}".strip() for note in notes)
 
 
 def _coloured(text: str, c: str) -> str:

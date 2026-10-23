@@ -12,17 +12,23 @@ with its random parts turned off, so a scenario always gives the same ticks.
   CEP subsets   the sanity filter, then every receiver subset the library's
                 ``_find_best_subset`` scores (OLS seed, LM fit, residuals,
                 weights, covariance, CEP) and the box check of
-                ``_validate_position``
+                ``_validate_position``.  The search goes as far as the
+                simulator's CEP subsets setting lets it (the first 15, as
+                UltraGPS-Control, by default); the subsets past that show
+                faintly in the chart, for comparison
   Blocking      each algorithm's fix in turn, then a sweep: how every fix
                 moves as one receiver's reading grows (as when it hears a
-                reflection)
+                reflection), with the library's bounds check at every offset
   LM optimiser  the cost surface Levenberg-Marquardt walks down, every point
                 MINPACK evaluates from an initial guess, and where many
                 different starts end up
 
 Every number comes from ``engine.lab``, which watches the real library on a
 private ``UltraGPSPositionLib``; the simulator's own library (and its filter
-memory) is never touched.
+memory) is never touched.  The solver settings (filter mode, CEP subsets) are
+the simulator's, taken up again whenever the window is activated.  Space,
+Left/Right and Home/End drive the current story, except in a focused control
+that uses the key itself.
 """
 
 from __future__ import annotations
@@ -31,18 +37,20 @@ import contextlib
 import copy
 import html
 import math
+import threading
 import time
 from dataclasses import dataclass, replace
 from itertools import combinations
 
 import numpy as np
 import scipy
-from PyQt6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6 import sip
+from PyQt6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFontMetricsF, QKeySequence, QPainter, QPainterPath, QTransform
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDockWidget,
-                             QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QProgressBar,
-                             QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter,
-                             QStackedWidget, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
+from PyQt6.QtWidgets import (QAbstractButton, QAbstractItemView, QAbstractSlider, QApplication, QButtonGroup,
+                             QCheckBox, QComboBox, QDockWidget, QGridLayout, QHBoxLayout, QLabel, QMainWindow,
+                             QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter,
+                             QStackedWidget, QTabBar, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
                              QToolButton, QToolTip, QVBoxLayout, QWidget)
 
 from engine import lab
@@ -56,6 +64,10 @@ OVERRIDES     = {"clean": "Clean", "blocked": "Blocked", "offset": "+offset", "o
 STATE         = {"clean": "on", "blocked": "blocked", "offset": "on", "off": "off"}   # receiver state in the hardware
 # What engine.lab.static_solve returns (not EKF: it needs a history).
 STATIC_ALGOS  = ("OLS", "LM", "CEP", "CEP4", "ROBUST", "BIAS", "RANSAC")
+# Settings.cep_subsets, as the solver panel names them
+CEP_SUBSETS   = {"control": "First 15, as UltraGPS-Control", "all": "All"}
+# The solver settings engine.lab.static_solve reads (the EKF ones it never uses)
+LAB_SETTINGS  = ("filter_mode", "cep_subsets", "robust_scale_cm", "ransac_tol_cm")
 MAX_OFFSET_CM = 150
 SWEEP_STEPS   = 61
 STARTS_SIDE   = 6          # "many starts": a 6 × 6 grid of initial guesses
@@ -182,15 +194,20 @@ def make_table(headers) -> QTableWidget:
     t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     t.setAlternatingRowColors(True)
     t.setFont(theme.mono_font(8.5))
-    t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     t.horizontalHeader().setStretchLastSection(True)
+    # It follows the story: clicking a row jumps there, and the keys keep stepping the story
+    t.setFocusPolicy(Qt.FocusPolicy.NoFocus)
     return t
 
 
-def fill_table(t: QTableWidget, rows, bold=()) -> None:
+def fill_table(t: QTableWidget, rows, bold=(), headers=None) -> None:
+    """New rows, and columns as wide as every row needs (sized before the story hides any)."""
     t.blockSignals(True)
+    if headers is not None:
+        t.setHorizontalHeaderLabels(headers)
     t.setRowCount(len(rows))
     for r, row in enumerate(rows):
+        t.setRowHidden(r, False)
         for c, text in enumerate(row):
             it = QTableWidgetItem(text)
             it.setTextAlignment((Qt.AlignmentFlag.AlignLeft if c <= 1 else Qt.AlignmentFlag.AlignRight)
@@ -200,6 +217,7 @@ def fill_table(t: QTableWidget, rows, bold=()) -> None:
                 f.setBold(True)
                 it.setFont(f)
             t.setItem(r, c, it)
+    t.resizeColumnsToContents()
     t.blockSignals(False)
 
 
@@ -210,6 +228,7 @@ def show_rows(t: QTableWidget, last: int, current: int | None) -> None:
         t.setRowHidden(r, r > last)
     if current is not None and 0 <= current < t.rowCount():
         t.selectRow(current)
+        t.doItemsLayout()                  # the scroll range must count the rows just shown
         t.scrollToItem(t.item(current, 0))
     else:
         t.clearSelection()
@@ -300,9 +319,23 @@ def filter_html(sc: Scenario) -> str:
         f"<span class='muted'>{jump_note}</span></p>"
         + html_table(["", "heard", "tick · slope + icpt", "d cm", "bounds", "jump", "verdict"], rows)
         + f"<p>Kept: <b>{names(f.sane)}</b> ({len(f.sane)} of {len(f.rows)}). "
-        + ("Every subset of 3 or more of them is a candidate.</p>" if len(f.sane) >= 3 else
+        + (cep_search_html(sc) + "</p>" if len(f.sane) >= 3 else
            span("Fewer than 3: the library cannot solve and holds its last fix.", pal.status["lost"]) + "</p>")
     )
+
+
+def cep_search_html(sc: Scenario) -> str:
+    """Which subsets of the kept receivers the library's CEP scores, under the CEP subsets setting."""
+    n       = len(sc.sane)
+    total   = 1 + sum(math.comb(n, k) for k in range(3, n))      # the full set, then 3, 4, … receivers
+    scored  = lab.searched_count(n, S.cep_max_subsets(sc.settings, len(sc.filter.rows)))
+    setting = CEP_SUBSETS.get(sc.settings.cep_subsets, sc.settings.cep_subsets)
+    if total == 1:
+        return "The library's CEP has one subset to score: all three."
+    if scored < total:
+        return (f"The library's CEP scores the first {scored} of the {total} subsets of 3 or more of them "
+                f"(CEP subsets: {setting}).")
+    return f"The library's CEP scores every subset of 3 or more of them, all {total} (CEP subsets: {setting})."
 
 
 # ─── Playback ────────────────────────────────────────────────────────────────
@@ -1026,30 +1059,100 @@ def splitter(orientation, widgets, sizes) -> QSplitter:
     return s
 
 
+class FlowRow(QWidget):
+    """A row of controls, left-aligned, that wraps onto another line where the
+    tab is too narrow for it, so it never sets the window's minimum width.  A
+    widget that places its controls itself rather than a QLayout subclass: Qt
+    asks a layout for its items while it tears the window down, which Python
+    can no longer answer at exit."""
+
+    def __init__(self, widgets, margins=(8, 4, 8, 4), spacing: int = 6, parent=None):
+        super().__init__(parent)
+        self.items, self.margins, self.spacing = list(widgets), margins, spacing
+        for w in self.items:
+            w.setParent(self)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._place(width, move=False)
+
+    def sizeHint(self) -> QSize:                  # everything on one line
+        left, top, right, bottom = self.margins
+        hints = [w.sizeHint() for w in self.items]
+        width = sum(h.width() for h in hints) + self.spacing * max(len(hints) - 1, 0)
+        return QSize(left + width + right, top + max((h.height() for h in hints), default=0) + bottom)
+
+    def minimumSizeHint(self) -> QSize:           # one control per line at the most
+        left, top, right, bottom = self.margins
+        hints = [w.sizeHint() for w in self.items]
+        return QSize(left + max((h.width() for h in hints), default=0) + right,
+                     top + max((h.height() for h in hints), default=0) + bottom)
+
+    def event(self, e) -> bool:
+        if e.type() == QEvent.Type.LayoutRequest:          # a control's size changed (text, font, style)
+            self.updateGeometry()
+            self._place(self.width(), move=True)
+        return super().event(e)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place(self.width(), move=True)
+
+    def _place(self, width: int, move: bool) -> int:
+        """Lay the controls out in lines ``width`` wide, each centred in its line; the height used."""
+        left, top, right, bottom = self.margins
+        lines, line, x = [], [], left
+        for w in self.items:
+            hint = w.sizeHint()
+            if line and x + hint.width() > width - right:
+                lines.append(line)
+                line, x = [], left
+            line.append((w, hint))
+            x += hint.width() + self.spacing
+        if line:
+            lines.append(line)
+        y = top
+        for n, line in enumerate(lines):
+            h, x = max(hint.height() for _, hint in line), left
+            for w, hint in line:
+                if move:
+                    w.setGeometry(QRect(x, y + (h - hint.height()) // 2, hint.width(), hint.height()))
+                x += hint.width() + self.spacing
+            y += h + (self.spacing if n < len(lines) - 1 else 0)
+        return y + bottom
+
+
 # ─── Tab 1: CEP subsets ──────────────────────────────────────────────────────
 
 class CepChart(QWidget):
     """The CEP of every subset in the library's order, as bars on a log scale,
     with a dot matrix of each subset's receivers underneath.  Bars appear as
-    the animation reaches them; click one to jump to it."""
+    the animation reaches them; click one to jump to it.  Where the library's
+    search stops short (``max_subsets``), a dashed line marks it, and the
+    subsets past it show faintly at the end, for comparison."""
 
     picked = pyqtSignal(int)
     LEFT, RIGHT, TOP, ROW = 46, 10, 22, 10
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.steps   = []
-        self.rows    = []          # receivers that can be members
-        self.winner  = None
-        self.shown   = 0
-        self.current = None
-        self.phase   = 1.0
-        self.final   = False
+        self.steps    = []
+        self.rows     = []         # receivers that can be members
+        self.winner   = None
+        self.best_all = None       # the winner had every subset been scored
+        self.searched = 0          # subsets the library scores
+        self.shown    = 0
+        self.current  = None
+        self.phase    = 1.0
+        self.final    = False
         self.setMinimumHeight(170)
         self.setMouseTracking(True)
 
     def set_trace(self, trace: lab.CepTrace) -> None:
         self.steps, self.rows, self.winner = trace.steps, list(trace.sane), trace.best
+        self.best_all, self.searched = trace.best_all, trace.searched
         self.update()
 
     def set_progress(self, shown: int, current, phase: float, final: bool) -> None:
@@ -1114,18 +1217,30 @@ class CepChart(QWidget):
         for i in range(self.shown):
             cep  = ceps[i]
             cur  = i == self.current
+            past = i >= self.searched          # the library never scores it
             v    = hi if not np.isfinite(cep) else cep
             if cur and self.phase < 1:
                 v = lo * (v / lo) ** ease(self.phase)
             rect = QRectF(xs[i] - w * 0.35, Y(v), w * 0.7, bottom - Y(v))
             path = QPainterPath()
             path.addRect(rect)
-            c = pal.accent if cur else cc
+            c = pal.accent if cur else pal.text_muted if past else cc
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(color(c, 0.35 if cur else 0.12))
+            p.setBrush(color(c, 0.35 if cur else 0.06 if past else 0.12))
             p.drawPath(path)
-            draw.stroke(p, path, c, 1.6 if cur else 1.0, 1.0 if cur else 0.75,
-                        dash=None if np.isfinite(cep) else draw.DASH)
+            draw.stroke(p, path, c, 1.6 if cur else 1.0, 1.0 if cur else 0.5 if past else 0.75,
+                        dash=draw.DASH if past or not np.isfinite(cep) else None, glow=False if past else None)
+        if self.searched < len(self.steps):
+            x = (xs[self.searched - 1] + xs[self.searched]) / 2 if self.searched else self.LEFT
+            p.setPen(draw.pen(pal.text_dim, 1.0, 0.8, draw.DASH))
+            p.drawLine(QPointF(x, top - 2), QPointF(x, self.height() - 16))
+            draw.label(p, QPointF(x + 5, top + 6), f"library stops: {self.searched} of {len(self.steps)}",
+                       pal.text_dim, 7)
+        a = self.best_all
+        if self.final and a is not None and a != self.winner:
+            q = QPointF(xs[a], Y(ceps[a]) - 9)
+            draw.marker(p, q, "star", pal.text_dim, 9, 1.2, 0.8)
+            draw.label(p, QPointF(q.x(), q.y() - 11), f"best of all {len(self.steps)}", pal.text_dim, 7, "center")
         if best is not None and (self.current is None or self.phase >= 1 or best != self.current):
             q = QPointF(xs[best], Y(ceps[best]) - 9)
             draw.marker(p, q, "star", pal.algo["CEP"], 9, 1.2, fill=0.4)
@@ -1138,7 +1253,7 @@ class CepChart(QWidget):
             y = mtop + r * self.ROW + self.ROW / 2
             draw.label(p, QPointF(self.LEFT - 6, y), f"R{rx}", pal.text_muted, 7, "right", halo=False)
             for i, s in enumerate(self.steps):
-                member, live = rx in s.subset, i < self.shown
+                member, live = rx in s.subset, i < min(self.shown, self.searched)
                 c = pal.accent if i == self.current else pal.text_dim
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(color(c if member else pal.text_muted, (0.9 if member else 0.35) * (1 if live else 0.3)))
@@ -1154,7 +1269,7 @@ class CepChart(QWidget):
 
     def mousePressEvent(self, e) -> None:
         i = self._column_at(e.position().x())
-        if i is not None and e.button() == Qt.MouseButton.LeftButton:
+        if i is not None and i < self.searched and e.button() == Qt.MouseButton.LeftButton:
             self.picked.emit(i)
 
     def event(self, e) -> bool:
@@ -1163,9 +1278,11 @@ class CepChart(QWidget):
             if i is None:
                 QToolTip.hideText()
             else:
-                s = self.steps[i]
-                QToolTip.showText(e.globalPos(), f"subset {i + 1}: {names(s.subset)}\nCEP {num(s.cep)} cm\n"
-                                  "click to jump to this step", self)
+                s    = self.steps[i]
+                what = ("click to jump to this step" if i < self.searched else
+                        f"past the library's search (it stops after {self.searched}): shown for comparison")
+                QToolTip.showText(e.globalPos(), f"subset {i + 1}: {names(s.subset)}\nCEP {num(s.cep)} cm\n{what}",
+                                  self)
             return True
         return super().event(e)
 
@@ -1196,10 +1313,11 @@ class CepTab(LabTab):
 
     def compute(self) -> None:
         sc = self.sc
-        self.trace = tr = lab.trace_cep(self.lib, sc.distances, sc.sane)
-        self.steps = ["filter"] + list(range(len(tr.steps))) + ["validate"]
+        self.trace = tr = lab.trace_cep(self.lib, sc.distances, sc.sane,
+                                        S.cep_max_subsets(sc.settings, self.lib.receiver_count))
+        self.steps = ["filter"] + list(range(tr.searched)) + ["validate"]
         rows = []
-        for j, s in enumerate(tr.steps):
+        for j, s in enumerate(tr.steps[:tr.searched]):
             err = num(float(np.hypot(*(s.pos - sc.truth)))) if sc.truth is not None else "—"
             rows.append([f"{j + 1}{' ★' if j == tr.best else ''}", names(s.subset), num(s.cep),
                          num(s.pos[0]), num(s.pos[1]), err])
@@ -1220,12 +1338,12 @@ class CepTab(LabTab):
             return (f"validation: winner {names(w.subset)} (CEP {num(w.cep)} cm) "
                     + ("is outside the receivers' box: rejected" if tr.rejected else "is inside the box: accepted"))
         s = tr.steps[kind]
-        return (f"subset {kind + 1} of {len(tr.steps)}: {names(s.subset)} → CEP {num(s.cep)} cm"
+        return (f"subset {kind + 1} of {tr.searched}: {names(s.subset)} → CEP {num(s.cep)} cm"
                 + (" · best so far" if s.best else ""))
 
     def on_step(self, k: int) -> None:
         kind = self.steps[k]
-        last = len(self.trace.steps) - 1 if kind == "validate" else -1 if kind == "filter" else kind
+        last = self.trace.searched - 1 if kind == "validate" else -1 if kind == "filter" else kind
         show_rows(self.table, last, kind if isinstance(kind, int) else self.trace.best if kind == "validate" else None)
 
     def on_phase(self) -> None:
@@ -1403,8 +1521,8 @@ class CepTab(LabTab):
             lead = span(f"no: {names(b.subset)} still leads with {num(b.cep)} cm", pal.text_dim)
         whole = " (every kept receiver: the library tries the full set first)" if j == 0 else ""
         return (
-            f"<h3>Subset {j + 1} of {len(tr.steps)}: {names(idx)}</h3>"
-            f"<p class='muted'>_compute_cep(distances, {idx}){whole}</p>"
+            f"<h3>Subset {j + 1} of {tr.searched}: {names(idx)}</h3>"
+            f"<p class='muted'>_compute_cep(distances, {idx}){whole}<br>{self._search_line()}</p>"
             f"<p><b>1 · seed</b> <span class='dim'>_ols</span>: squaring and subtracting the range equations "
             f"makes them linear; one least-squares solve.<br>p<sub>0</sub> = {pt(s.seed)}</p>"
             f"<p><b>2 · fit</b> <span class='dim'>_nlls</span>: least_squares(method=\"lm\") from p<sub>0</sub> "
@@ -1423,9 +1541,57 @@ class CepTab(LabTab):
             + f"<p><b>Best so far?</b> {lead}</p>"
             "<p class='muted'>Receivers that agree with the fit get large weights (w = 10 for an exact fit, "
             "≈ 0.1 for one 10 cm off), so a subset whose readings agree scores a small CEP. "
+            "So Σ ranks the subsets; it is not the fix's covariance in cm² (the weights come from how well "
+            "the subset fits, not from the noise). The simulator's CEP ellipse uses the winning subset's "
+            "geometry and the noise LM sees over every kept receiver instead. "
             "The library takes J from the optimiser's result (result.jac, by finite differences); the rows "
             "above are the exact values it approximates.</p>"
         )
+
+    def _search_line(self) -> str:
+        """How far the library's subset search goes under the simulator's CEP subsets setting."""
+        tr, setting = self.trace, CEP_SUBSETS.get(self.sc.settings.cep_subsets, self.sc.settings.cep_subsets)
+        m = S.cep_max_subsets(self.sc.settings, self.lib.receiver_count)
+        if tr.searched < len(tr.steps):
+            return (f"The library scores the first {tr.searched} of the {len(tr.steps)} subsets: "
+                    f"max_subsets = {m} (CEP subsets: {setting}).")
+        if len(tr.steps) == 1:
+            return (f"The library scores the only subset, all three kept receivers (CEP subsets: {setting}, "
+                    f"max_subsets = {m}).")
+        return f"The library scores all {len(tr.steps)} subsets (CEP subsets: {setting}, max_subsets = {m})."
+
+    def _limit_html(self) -> str:
+        """What the search limit leaves out, and which subset would win without it (or with it)."""
+        sc, tr = self.sc, self.trace
+        n, m = len(tr.steps), S.CONTROL_MAX_SUBSETS
+        if tr.searched < n:
+            sizes, skipped = [], []
+            for k in sorted({len(s.subset) for s in tr.steps[1:]}):
+                total  = sum(len(s.subset) == k for s in tr.steps)
+                scored = sum(len(s.subset) == k for s in tr.steps[:tr.searched])
+                if scored == 0:
+                    skipped.append(f"{k}-receiver")
+                else:
+                    sizes.append(f"all {total} {k}-receiver subsets" if scored == total else
+                                 f"{scored} of the {total} {k}-receiver subsets")
+            what  = (f"the full set, then {', '.join(sizes)}" if sizes else "the full set")
+            what += f"; it never scores a {' or '.join(skipped)} subset" if skipped else ""
+            other, label = tr.best_all, f"Scoring all {n} (CEP subsets: All)"
+            out = f"<p>{self._search_line()} That is {what}."
+        elif n > m:
+            other, label = lab.winner(tr.steps, m), f"UltraGPS-Control (max_subsets = {m}, the library default)"
+            out = f"<p>{self._search_line()} {label} stops after {m}."
+        else:
+            return f"<p class='muted'>{self._search_line()}</p>"
+        if other is None or tr.best is None:
+            return out + "</p>"
+        o = tr.steps[other]
+        if other == tr.best:
+            return out + f" {label} would pick the same winner.</p>"
+        err = (f", error {num(float(np.hypot(*(o.pos - sc.truth))))} cm"
+               f" (this winner: {num(float(np.hypot(*(tr.steps[tr.best].pos - sc.truth))))} cm)"
+               if sc.truth is not None else "")
+        return out + f" {label} would pick <b>{names(o.subset)}</b> instead: CEP {num(o.cep)} cm{err}.</p>"
 
     def _validate_html(self) -> str:
         pal, sc, tr = theme.current, self.sc, self.trace
@@ -1438,18 +1604,24 @@ class CepTab(LabTab):
         okx, oky = x0 <= s.pos[0] <= x1, y0 <= s.pos[1] <= y1
         def tick(ok):
             return span("✓", pal.status["ok"]) if ok else span("✗", pal.status["lost"])
+        # A snapshot's library had no last good fix when it handed back the rejected fix itself
+        held = sc.held if sc.held is not None and np.hypot(*(sc.held - s.pos)) > 1e-6 else None
         if not tr.rejected:
             err  = f" Error from the true position: <b>{num(float(np.hypot(*(s.pos - sc.truth))))} cm</b>." \
                    if sc.truth is not None else ""
             what = span("Inside: accepted.", pal.status["ok"]) + f" This is the library's CEP fix.{err}"
-        elif sc.held is not None:
+        elif held is not None:
             what = (span("Outside: rejected.", pal.status["lost"]) +
-                    f" The library returns its last good CEP fix {pt(sc.held)} and success = False.")
-        else:
+                    f" The library returns its last good CEP fix {pt(held)} and success = False.")
+        elif sc.source == "lab":
             what = (span("Outside: rejected.", pal.status["lost"]) +
                     " In the running simulator the library would return its last good CEP fix; the lab has "
                     "none, so it hands back this fix with success = False.")
-        order = sorted(range(len(tr.steps)), key=lambda i: tr.steps[i].cep)[:6]
+        else:
+            what = (span("Outside: rejected.", pal.status["lost"]) +
+                    " The library had no last good CEP fix in that frame, so it returned this fix itself, with "
+                    "success = False.")
+        order = sorted(range(tr.searched), key=lambda i: tr.steps[i].cep)[:6]
         rows  = [[f"{i + 1}", names(tr.steps[i].subset), num(tr.steps[i].cep), pt(tr.steps[i].pos)] for i in order]
         return (
             "<h3>Validation: _validate_position</h3>"
@@ -1457,7 +1629,7 @@ class CepTab(LabTab):
             f"<p>The fix must lie in the receivers' bounding box:<br>"
             f"<span class='eq'>{num(x0)} ≤ x ≤ {num(x1)}</span> &nbsp; x = {num(s.pos[0])} {tick(okx)}<br>"
             f"<span class='eq'>{num(y0)} ≤ y ≤ {num(y1)}</span> &nbsp; y = {num(s.pos[1])} {tick(oky)}</p>"
-            f"<p>{what}</p><p class='dim'>Smallest CEPs:</p>"
+            f"<p>{what}</p>" + self._limit_html() + "<p class='dim'>Smallest CEPs:</p>"
             + html_table(["#", "receivers", "CEP cm", "fix"], rows)
         )
 
@@ -1466,40 +1638,54 @@ class CepTab(LabTab):
 
 class SweepWorker(QThread):
     """Runs ``engine.lab.sweep`` (a few seconds) off the GUI thread, on its own
-    library instance so the tabs can keep using theirs."""
+    library instance so the tabs can keep using theirs.  Setting ``cancel``
+    stops it within one offset."""
 
-    done = pyqtSignal(int, object)      # token, Sweep or an error message
+    done = pyqtSignal(int, object)      # token, Sweep, None (cancelled) or an error message
 
     def __init__(self, token: int, config_path: str, limits, distances, idx, receiver: int,
                  max_offset: float, steps: int, settings, parent=None):
         super().__init__(parent)
-        self.token = token
-        self.args  = (config_path, limits, np.array(distances, dtype=float), list(idx), receiver,
-                      max_offset, steps, settings)
+        self.token  = token
+        self.cancel = threading.Event()
+        self.args   = (config_path, limits, np.array(distances, dtype=float), list(idx), receiver,
+                       max_offset, steps, settings)
 
     def run(self) -> None:
         config_path, limits, d, idx, receiver, max_offset, steps, settings = self.args
         lib = UltraGPSPositionLib(config_path)
         lib.max_distance, lib.max_differential = limits
         try:
-            result = lab.sweep(lib, d, idx, receiver, max_offset, steps, settings)
+            result = lab.sweep(lib, d, idx, receiver, max_offset, steps, settings, self.cancel)
         except Exception as exc:        # report it: a dead worker would leave the tab busy forever
             result = f"sweep failed: {exc}"
         self.done.emit(self.token, result)
 
 
+def no_cep_fix(sweep: lab.Sweep, k: int) -> str:
+    """Why the library's CEP has no fix at step ``k`` of a sweep."""
+    if sweep.kept and len(sweep.kept[k]) < 3:
+        return "fewer than 3 receivers kept"
+    return "no subset fixes both x and y"
+
+
 def cep_switches(sweep: lab.Sweep) -> list:
-    """Where the library's CEP changes subset: ``[(step, offset, text)]``."""
+    """Where the library's CEP changes subset, loses its fix or gets it back: ``[(step, offset, text)]``."""
     out = []
     for k in range(1, len(sweep.offsets)):
         a, b = set(sweep.cep_subsets[k - 1]), set(sweep.cep_subsets[k])
-        if a != b:
+        at   = f"+{sweep.offsets[k]:.0f} cm"
+        if a and not b:              # not a choice of CEP's: the library has nothing to solve with
+            out.append((k, float(sweep.offsets[k]), f"CEP has no fix at {at}: {no_cep_fix(sweep, k)}"))
+        elif b and not a:
+            out.append((k, float(sweep.offsets[k]), f"CEP has a fix again at {at}: {names(sorted(b))}"))
+        elif a != b:
             parts = (["drops " + names(sorted(a - b))] if a - b else []) + \
                     (["takes " + names(sorted(b - a))] if b - a else [])
-            out.append((k, float(sweep.offsets[k]), f"CEP {' and '.join(parts)} at +{sweep.offsets[k]:.0f} cm"))
-        if sweep.cep_rejected[k] != sweep.cep_rejected[k - 1]:
+            out.append((k, float(sweep.offsets[k]), f"CEP {' and '.join(parts)} at {at}"))
+        if a and b and sweep.cep_rejected[k] != sweep.cep_rejected[k - 1]:
             where = "leaves" if sweep.cep_rejected[k] else "comes back into"
-            out.append((k, float(sweep.offsets[k]), f"CEP fix {where} the box at +{sweep.offsets[k]:.0f} cm"))
+            out.append((k, float(sweep.offsets[k]), f"CEP fix {where} the box at {at}"))
     return out
 
 
@@ -1580,7 +1766,8 @@ class SweepCharts(QWidget):
         self.title    = ""
         self.setMinimumHeight(110)
         self.setToolTip("Each algorithm's error against the offset added to the swept receiver; "
-                        "dotted lines: where the library's CEP changes subset")
+                        "dotted lines: where the library's CEP changes subset; dashed red line: where the "
+                        "reading passes the top band and the library's bounds check drops it")
 
     def set_sweep(self, sweep: lab.Sweep | None, truth, switches) -> None:
         self.sweep, self.switches, self.errors = sweep, switches, {}
@@ -1614,7 +1801,10 @@ class SweepCharts(QWidget):
             draw.label(p, QPointF(self.width() / 2, self.height() / 2),
                        "pick a receiver and press Run sweep", pal.text_muted, 8.5, "center")
             return
-        draw.label(p, QPointF(10, 11), self.title, pal.text_dim, 8, halo=False)
+        title = self.title
+        if self.sweep.dropped is not None:
+            title += f" · red dashes: R{self.sweep.receiver} too far, dropped"
+        draw.label(p, QPointF(10, 11), title, pal.text_dim, 8, halo=False)
         algos = [a for a in STATIC_ALGOS if a in self.errors]
         fm    = QFontMetricsF(theme.mono_font(7.5))
         cols  = self.columns(len(algos))
@@ -1656,6 +1846,10 @@ class SweepCharts(QWidget):
                 p.setPen(draw.pen(pal.algo["CEP"] if a == "CEP" else pal.text_muted,
                                   1.0, 0.8 if a == "CEP" else 0.4, draw.DOT))
                 p.drawLine(QPointF(X(off), plot.top()), QPointF(X(off), plot.bottom()))
+            if self.sweep.dropped is not None:
+                x = X(float(offs[self.sweep.dropped]))
+                p.setPen(draw.pen(pal.status["lost"], 1.0, 0.7, draw.DASH))
+                p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
             full = draw.polyline_path([QPointF(X(o), Y(v)) for o, v in zip(offs, err) if math.isfinite(v)])
             draw.stroke(p, full, c, 1.0, 0.3, glow=False)
             done = [QPointF(X(o), Y(v)) for o, v in zip(offs, err) if math.isfinite(v) and o <= self.cursor]
@@ -1672,8 +1866,9 @@ ALGO_HOW = {
     "OLS":    "Every kept receiver counts equally in one linear solve, so a bad range shifts it directly.",
     "LM":     "Least squares over every kept receiver: one bad range's error is shared out among all the "
               "residuals, dragging the fix toward it.",
-    "CEP":    "Scores every subset of 3+ and keeps the most self-consistent one, so it can leave a bad "
-              "receiver out; must land inside the receivers' box.",
+    "CEP":    "Scores subsets of 3+ (only the first 15 with CEP subsets First 15, as UltraGPS-Control) and keeps "
+              "the most self-consistent one, so it can leave a bad receiver out; must land inside the receivers' "
+              "box.",
     "CEP4":   "Like CEP but subsets of 4+ only, with the textbook CEP: needs 4 receivers that agree.",
     "ROBUST": "Soft-L1 loss: residuals beyond the knee count linearly, not squared, so an outlier pulls less.",
     "BIAS":   "Also fits one offset shared by all receivers: absorbs a common timing error, not one bad range.",
@@ -1760,26 +1955,39 @@ class BlockingTab(LabTab):
 
     # ─── Computing ───────────────────────────────────────────────────────────
 
+    def set_scenario(self, sc: Scenario, lib) -> None:
+        self.stop()                      # a sweep still running belongs to the old scenario
+        super().set_scenario(sc, lib)
+
     def compute(self) -> None:
         sc = self.sc
         self.fixes   = lab.static_solve(self.lib, sc.distances, sc.sane, sc.settings)
-        self._token += 1                 # a sweep still running belongs to the old scenario
+        self._token += 1
         self.sweep   = None
         self.charts.set_sweep(None, None, [])
         self.b_sweep.setEnabled(False)
-        keep = self.rx.currentData()
+        keep  = self.rx.currentData()
+        sweep = self.inputs("RANSAC")    # with Bounds only, the simulator algorithms see more than the library
         self.rx.blockSignals(True)
         self.rx.clear()
-        for i in sc.sane:
-            self.rx.addItem(f"R{i}", i)
-        bad  = [i for i in sc.sane if sc.offsets[i] or sc.states[i] != "on"]   # the story's suspect first
-        pick = keep if keep in bad else bad[0] if bad else keep if keep in sc.sane else None
+        for i in sweep:
+            self.rx.addItem(f"R{i}" if i in sc.sane else f"R{i} (jumped)", i)
+        bad  = [i for i in sweep if sc.offsets[i] or sc.states[i] != "on"]   # the story's suspect first
+        pick = keep if keep in bad else bad[0] if bad else keep if keep in sweep else None
         if pick is not None:
-            self.rx.setCurrentIndex(sc.sane.index(pick))
+            self.rx.setCurrentIndex(self.rx.findData(pick))
         self.rx.blockSignals(False)
         self._enable_run()
         self.bars.set_rows([(a, self._error(a), self._note(a)) for a in STATIC_ALGOS], sc.truth is not None)
         self._set_story("fixes")
+
+    def inputs(self, a: str) -> list:
+        """The receivers algorithm ``a`` is given: the library filter's kept ones,
+        or with Bounds only, every one within the bounds for the simulator's own."""
+        sc = self.sc
+        if S.ALGORITHMS[a].source == "library" or sc.settings.filter_mode == "library":
+            return sc.sane
+        return [r.receiver for r in sc.filter.rows if r.in_bounds]
 
     def _error(self, a: str) -> float | None:
         e = self.fixes.get(a)
@@ -1810,7 +2018,8 @@ class BlockingTab(LabTab):
             self.restart(len(self.steps), self.STEP_SECONDS, play)
 
     def _enable_run(self) -> None:
-        self.run_button.setEnabled(self._worker is None and self.rx.count() > 0 and len(self.sc.sane) >= 3)
+        self.run_button.setEnabled(self._worker is None and self.rx.count() > 0
+                                   and self.sc is not None and len(self.inputs("RANSAC")) >= 3)
         self.run_button.setText("Sweeping…" if self._worker is not None else "Run sweep")
 
     def run_sweep(self) -> None:
@@ -1821,19 +2030,18 @@ class BlockingTab(LabTab):
         self._worker = SweepWorker(self._token, lib._config_path, (lib.max_distance, lib.max_differential),
                                    sc.distances, sc.sane, self.rx.currentData(), float(self.max_off.value()),
                                    self.sweep_steps, copy.copy(sc.settings), self)
-        self._worker.done.connect(self._on_sweep)
+        self._worker.done.connect(self._on_sweep)     # a method, not a lambda: queued safely if the tab goes first
         self.busy.show()
         self._enable_run()
         self.bar.set_text(f"sweeping R{self.rx.currentData()} from 0 to +{self.max_off.value()} cm…")
         self._worker.start()
 
     def _on_sweep(self, token: int, result) -> None:
-        self._worker.wait()
-        self._worker.deleteLater()
-        self._worker = None
-        self.busy.hide()
-        self._enable_run()
-        if token != self._token or self._dirty:       # the scenario changed while it ran
+        worker = self.sender()
+        if worker is None or worker is not self._worker:      # stop() has already let it go
+            return
+        self._release()
+        if token != self._token or self._dirty or result is None:   # the scenario changed while it ran
             return
         if isinstance(result, str):
             self.bar.set_text(result)
@@ -1842,12 +2050,25 @@ class BlockingTab(LabTab):
         self.switches = cep_switches(result)
         self.charts.set_sweep(result, self.sc.truth, self.switches)
         self.b_sweep.setEnabled(True)
-        self._set_story("sweep", play=True)
+        self._set_story("sweep", play=self.isVisible())
+
+    def _release(self) -> None:
+        """Wait for the finished (or cancelled) worker and let it go."""
+        self._worker.wait()
+        self._worker.deleteLater()
+        self._worker = None
+        self.busy.hide()
+        if self.sc is not None:
+            self._enable_run()
 
     def stop(self) -> None:
-        """Wait for a running sweep (before the window goes away)."""
+        """Cancel a running sweep: it stops within one offset, and its result is dropped."""
         if self._worker is not None:
-            self._worker.wait()
+            self._worker.cancel.set()
+            self._token += 1
+            self._release()
+            self._shown = None               # the bar said "sweeping…": describe the step again
+            self._on_player()
 
     # ─── Steps ───────────────────────────────────────────────────────────────
 
@@ -1859,8 +2080,13 @@ class BlockingTab(LabTab):
         if self.story == "sweep":
             sw  = self.sweep
             now = [text for sk, _, text in self.switches if sk == k]
-            return (f"R{sw.receiver} +{sw.offsets[k]:.1f} cm: CEP uses {names(sw.cep_subsets[k])}"
-                    + (f" · {now[0]}" if now else ""))
+            out = "" if sw.in_band[k] else (", past the top band: the bounds check drops it" if k == sw.dropped
+                                            else ", past the top band: dropped")
+            if sw.cep_subsets[k]:
+                cep = f"CEP uses {names(sw.cep_subsets[k])}"
+            else:                                       # the only change it can have here is losing the fix
+                cep, now = f"CEP has no fix ({no_cep_fix(sw, k)})", []
+            return f"R{sw.receiver} +{sw.offsets[k]:.1f} cm{out} · {cep}" + (f" · {now[0]}" if now else "")
         kind = self.steps[k]
         if kind == "filter":
             return f"filter: kept {names(self.sc.sane)}"
@@ -2003,11 +2229,14 @@ class BlockingTab(LabTab):
         pal, sc, sw = theme.current, self.sc, self.sweep
         i   = sw.receiver
         off = self._offset(k, t)
+        out = not sw.in_band[k]                 # past the top band: the bounds check drops the reading
         draw_ranges(p, view, sc, [j for j in sc.sane if j != i], dropped_too=False)
         d = float(sc.distances[i])
         draw.circle(p, view, sc.coords[i], d, pal.text_dim, 1.0, 0.6, draw.DOT)
-        draw.circle(p, view, sc.coords[i], d + off, pal.status["echo"], 1.5, 0.95)
-        draw_receivers(p, view, sc, lit=set(sc.sane), rings=self._rings(), thick={i})
+        draw.circle(p, view, sc.coords[i], d + off, pal.status["lost"] if out else pal.status["echo"], 1.5, 0.95,
+                    draw.DOT if out else None)
+        draw_receivers(p, view, sc, lit=set(sc.sane) - ({i} if out else set()), rings=self._rings(),
+                       thick=set() if out else {i})
         heads = self._sweep_marks(p, view, k, t)
         draw_truth(p, view, sc.truth)
         for n, (sk, _, text) in enumerate(s for s in self.switches if s[0] <= k):
@@ -2023,7 +2252,8 @@ class BlockingTab(LabTab):
             return f"{num(float(np.hypot(*(h - sc.truth))))} cm"
 
         keys = [Key(theme.ALGO_SHAPES[a], pal.algo[a], a, error(h), spare=True) for a, h in heads]
-        keys += [Key("line", pal.status["echo"], f"R{i} range +{off:.0f} cm", strong=True),
+        keys += [Key("dot", pal.status["lost"], f"R{i} range +{off:.0f} cm: too far, dropped", strong=True) if out
+                 else Key("line", pal.status["echo"], f"R{i} range +{off:.0f} cm", strong=True),
                  Key("dot", pal.text_dim, f"R{i} range as read"),
                  Key("cross", pal.algo["CEP"], "CEP changes subset")]
         if sc.truth is not None:
@@ -2051,10 +2281,10 @@ class BlockingTab(LabTab):
             return self._summary_html()
         return self._algo_html(kind)
 
-    def _residual_rows(self, pos) -> list:
+    def _residual_rows(self, pos, receivers) -> list:
         pal, sc = theme.current, self.sc
         rows = []
-        for i in sc.sane:
+        for i in receivers:
             rng = float(np.hypot(*(np.asarray(pos) - sc.coords[i])))
             st  = sc.status[i]
             err = sc.error(i)
@@ -2077,8 +2307,17 @@ class BlockingTab(LabTab):
                 + f"<br>uses {names(e.used)}" + (f" · {e.note}" if e.note else "") + "</p>"
                 + "<p class='dim'>Residuals at this fix, r = |p − R| − d (the reading's own error is its "
                   "distance minus the true range):</p>"
-                + html_table(["", "heard", "reading err", "d", "|p − R|", "r"], self._residual_rows(e.pos))
-                + f"<p class='muted'>{ALGO_HOW[a]}</p>")
+                + html_table(["", "heard", "reading err", "d", "|p − R|", "r"],
+                             self._residual_rows(e.pos, self.inputs(a)))
+                + f"<p class='muted'>{ALGO_HOW[a]}{self._mode_note(a)}</p>")
+
+    def _mode_note(self, a: str) -> str:
+        """With Bounds only, which readings a simulator algorithm sees that the library dropped."""
+        extra = [i for i in self.inputs(a) if i not in self.sc.sane]
+        if not extra:
+            return ""
+        return (f" Filter mode Bounds only: it also sees {names(extra)}, which the library's jump check "
+                "dropped, and leaves them to its own outlier handling.")
 
     def _summary_html(self) -> str:
         pal, sc = theme.current, self.sc
@@ -2091,6 +2330,7 @@ class BlockingTab(LabTab):
                          e.note if e is not None else self._note(a)])
         dropped = [i for i in range(len(sc.coords)) if i not in sc.sane]
         bad     = [i for i in sc.sane if (err := sc.error(i)) is not None and abs(err) > 3.0]
+        jumped  = [i for i in self.inputs("RANSAC") if i not in sc.sane]
         if not sc.readings:
             lesson = "These are replayed ticks: how far each reading was off is not known."
         elif bad:
@@ -2101,6 +2341,9 @@ class BlockingTab(LabTab):
             lesson = ("Every kept reading is within 3 cm of the truth, so the algorithms agree"
                       + (f": the filter has already dropped {names(dropped)}." if dropped else
                          "; set a receiver to Blocked or +offset to see them part."))
+        if jumped:
+            lesson += (f" Filter mode Bounds only: CEP4, ROBUST, BIAS and RANSAC also see {names(jumped)}, which "
+                       "the library's jump check dropped; OLS, LM and CEP use only the receivers it kept.")
         return ("<h3>Ranking by error</h3>"
                 + html_table(["#", "", "error cm", "uses", "note"], rows, "rlrll")
                 + f"<p>{lesson}</p>")
@@ -2120,18 +2363,33 @@ class BlockingTab(LabTab):
                          names(sw.cep_subsets[k]) if a == "CEP" else ""])
         sw_rows = "".join(f"<br>{'<b>' if sk <= k else ''}{text}{'</b>' if sk <= k else ''}"
                           for sk, _, text in self.switches) or "<br>none: CEP keeps the same subset"
+        top, cut = sw.top_band, sw.dropped
+        if sw.in_band[k]:
+            band = (f"0 &lt; d<sub>{i}</sub> ≤ {num(top)}: within the top band, so the bounds check keeps it"
+                    + (f" (until +{sw.offsets[cut]:.0f} cm)." if cut is not None else "."))
+        else:
+            band = span(f"d<sub>{i}</sub> &gt; {num(top)}: past the top band, so the library's bounds check "
+                        f"drops R{i}", pal.status["lost"]) + f" (from +{sw.offsets[cut]:.0f} cm)."
+        if sw.kept and len(sw.kept[k]) < 3:
+            band += (f" That leaves the library only {names(sw.kept[k])}: with fewer than 3 receivers its OLS, "
+                     "LM and CEP cannot solve.")
         return (f"<h3>R{i} reads +{off:.1f} cm long</h3>"
                 f"<p><span class='eq'>d<sub>{i}</sub> = {num(sc.distances[i])} + {off:.1f} = "
                 f"{num(sc.distances[i] + off)} cm</span>"
                 + (f" <span class='muted'>(true range {num(sc.readings[i].true_cm)})</span>" if sc.readings else "")
-                + "</p>" + html_table(["", "fix", "error cm", "CEP subset"], rows)
+                + f"<br>{band}</p>" + html_table(["", "fix", "error cm", "CEP subset"], rows)
                 + f"<p>Where the library's CEP changes subset:{sw_rows}</p>"
-                "<p class='muted'>The filter is not re-run: the reading stays kept however long it gets, as on "
-                "every frame after the first once a receiver is blocked (the jump check only catches the "
-                "frame where the reading changes).</p>")
+                "<p class='muted'>At every offset the library's bounds check is applied again. Its jump check is "
+                "not: the readings are taken to have been like this for a while, as on every frame after the "
+                "first once a receiver is blocked (the jump check only catches the frame where the reading "
+                "changes).</p>")
 
 
 # ─── Tab 3: LM optimiser ─────────────────────────────────────────────────────
+
+RECEIVERS_TIP = "Receivers LM fits: every one the filter kept, or any three of them"
+LM_HEADERS    = ["#", "kind", "x", "y", "RMS cm", "|δ| cm"]
+
 
 def rms_at(coords, d, pos) -> float:
     """RMS range residual (cm) of a fix: what LM minimises (as ½ Σ r²)."""
@@ -2164,7 +2422,10 @@ class LmTab(LabTab):
         self.line_triple = None
 
         self.receivers = QComboBox()
-        self.receivers.setToolTip("Receivers LM fits: every one the filter kept, or any three of them")
+        # Short, so the controls row never squeezes the Scenario dock; the popup shows the names in full
+        self.receivers.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.receivers.setMinimumContentsLength(12)
+        self.receivers.setToolTip(RECEIVERS_TIP)
         self.receivers.currentIndexChanged.connect(self._on_receivers)
         self.b_line = QPushButton("3 in a line")
         self.b_line.setCheckable(True)
@@ -2185,25 +2446,25 @@ class LmTab(LabTab):
         self.b_seed.setToolTip("Start LM from the library's OLS seed again, as the library does")
         self.b_seed.clicked.connect(self.reset_start)
         self.canvas.clicked.connect(self.set_start)
-        self.table = make_table(["#", "kind", "x", "y", "RMS cm", "|δ| cm"])
+        self.table = make_table(LM_HEADERS)
         self.table.setToolTip("Every point LM evaluated (or, with many starts, where each start ended); "
                               "click a row to jump to it")
         self.table.cellClicked.connect(lambda r, _c: None if self.b_many.isChecked() else self.player.seek(r))
 
-        controls = QHBoxLayout()
-        controls.setContentsMargins(8, 4, 8, 4)
+        pick = QWidget()                 # the label stays with its combo when the row wraps
+        pl   = QHBoxLayout(pick)
+        pl.setContentsMargins(0, 0, 0, 0)
         rl = QLabel("Receivers")
         rl.setProperty("role", "dim")
-        controls.addWidget(rl)
-        controls.addWidget(self.receivers)
-        for w in (self.b_line, self.b_many, self.c_probes, self.b_seed):
-            controls.addWidget(w)
-        controls.addStretch(1)
+        pl.addWidget(rl)
+        pl.addWidget(self.receivers)
+        # Wraps where the window is narrow, rather than squeezing the Scenario dock
+        self.controls = FlowRow([pick, self.b_line, self.b_many, self.c_probes, self.b_seed])
         right = splitter(Qt.Orientation.Vertical, [self.text, self.table], [480, 230])
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        lay.addLayout(controls)
+        lay.addWidget(self.controls)
         lay.addWidget(splitter(Qt.Orientation.Horizontal, [self.canvas, right], [640, 430]), 1)
         lay.addWidget(self.bar)
 
@@ -2226,6 +2487,7 @@ class LmTab(LabTab):
                 lines.append(tri)
         at = self.receivers.findData(keep) if keep is not None else 0
         self.receivers.setCurrentIndex(max(at, 0))
+        self.receivers.setToolTip(f"{RECEIVERS_TIP}. Now: {self.receivers.currentText()}")
         ref = sc.truth if sc.truth is not None else sc.coords[sc.sane].mean(axis=0) if sc.sane else np.zeros(2)
         self.line_triple = min(lines, key=lambda t: self._line_distance(t, ref)) if lines else None
         self.receivers.blockSignals(False)
@@ -2247,6 +2509,7 @@ class LmTab(LabTab):
         self.receivers.setCurrentIndex(self.receivers.findData(self.line_triple) if on else 0)
 
     def _on_receivers(self, _i: int) -> None:
+        self.receivers.setToolTip(f"{RECEIVERS_TIP}. Now: {self.receivers.currentText()}")
         self._sync_line_button()
         if self.sc is not None and not self._dirty:
             self._solve()
@@ -2326,8 +2589,8 @@ class LmTab(LabTab):
             self.steps = list(range(n))
             fill_table(self.table, [[f"{s + 1}", f"{num(st[0])}, {num(st[1])}", num(t.final[0]), num(t.final[1]),
                                      num(self.minima[self.basin[s]][1]), "→ " + "ABCDEFGHIJ"[self.basin[s] % 10]]
-                                    for s, (st, t) in enumerate(self.many)])
-            self.table.setHorizontalHeaderLabels(["#", "start", "fix x", "fix y", "RMS cm", "minimum"])
+                                    for s, (st, t) in enumerate(self.many)],
+                       headers=["#", "start", "fix x", "fix y", "RMS cm", "minimum"])
             self.restart(n, self.MANY_SECONDS, play)
             return
         self.points = [q for q in self.trace.points if self.c_probes.isChecked() or q[2] != "jacobian"]
@@ -2340,8 +2603,7 @@ class LmTab(LabTab):
                          "—" if kind == "start" else num(float(np.hypot(*(x - cur[0]))))])
             if kind in ("start", "step"):
                 cur = (x, rms)
-        fill_table(self.table, rows)
-        self.table.setHorizontalHeaderLabels(["#", "kind", "x", "y", "RMS cm", "|δ| cm"])
+        fill_table(self.table, rows, headers=LM_HEADERS)
         self.steps = list(range(len(self.points)))
         self.restart(len(self.steps), self.STEP_SECONDS, play)
 
@@ -2823,6 +3085,39 @@ class ScenarioPanel(QWidget):
 
 # ─── Window ──────────────────────────────────────────────────────────────────
 
+STORY_KEYS = {"Space": "toggle", "Left": "prev", "Right": "next", "Home": "first", "End": "last"}
+
+
+def wants_key(widget, key) -> bool:
+    """Does the focused ``widget`` (a button, slider, combo or tab bar) use this story key itself?"""
+    if isinstance(widget, QComboBox):                 # Space opens it, Home and End choose (it ignores Left, Right)
+        return key in (Qt.Key.Key_Space, Qt.Key.Key_Home, Qt.Key.Key_End)
+    if isinstance(widget, QAbstractButton):           # Space presses it, toggles a check box
+        return key == Qt.Key.Key_Space
+    if isinstance(widget, QTabBar):                   # the arrows change the tab (it ignores Home, End)
+        return key in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+    return key != Qt.Key.Key_Space                    # sliders move with the arrows, Home and End
+
+
+class KeysToFocus(QObject):
+    """Event filter on the lab's controls: a story key the focused control uses
+    goes to that control, not to the window's shortcut.  Space toggles a focused
+    check box rather than playing, Right moves a focused slider rather than
+    stepping.  Elsewhere (the canvas, the explanation) the keys drive the story."""
+
+    KEYS = {Qt.Key.Key_Space, Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Home, Qt.Key.Key_End}
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride and event.key() in self.KEYS:
+            mods = event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
+                                        | Qt.KeyboardModifier.MetaModifier)
+            if not mods:
+                # Accepted: the control gets the key press and the shortcut does not fire.  Set either
+                # way, so this has the last word over an application-wide filter that ran first.
+                event.setAccepted(wants_key(obj, event.key()))
+        return False
+
+
 class LabWindow(QMainWindow):
     """The algorithm lab: a Scenario dock beside one tab per algorithm story."""
 
@@ -2887,18 +3182,35 @@ class LabWindow(QMainWindow):
         self.panel.loadRequested.connect(self.load_latest)
         self.cep_tab.canvas.clicked.connect(self.place_transmitter)
         self.blocking_tab.canvas.clicked.connect(self.place_transmitter)
-        for key, name in (("Space", "toggle"), ("Left", "prev"), ("Right", "next"), ("Home", "first"),
-                          ("End", "last")):
+        for key, name in STORY_KEYS.items():
             a = QAction(self)
             a.setShortcut(QKeySequence(key))
             a.triggered.connect(lambda _=False, n=name: getattr(self.tabs.currentWidget().player, n)())
             self.addAction(a)
+        self._keys = KeysToFocus(self)
+        # Only on the controls made here, and the tab bar: a Python filter on the scroll bars Qt makes
+        # for its scroll areas (they never take the focus anyway) crashes PyQt's clean-up at exit.
+        for w in self.findChildren((QAbstractButton, QAbstractSlider, QComboBox)):
+            if sip.ispycreated(w):
+                w.installEventFilter(self._keys)
+        self.tabs.tabBar().installEventFilter(self._keys)
+        for tab in self.tab_list:
+            tab.canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)     # a click there hands the keys back to the story
+        self.tabs.currentChanged.connect(self._focus_canvas)
+        # Never narrower than the panel needs: the tabs give way first
+        scroll.setMinimumWidth(self.panel.minimumSizeHint().width() + scroll.verticalScrollBar().sizeHint().width())
         self._overrides_from_sim()
         self.rebuild()
+        self.cep_tab.canvas.setFocus()
 
     @property
     def tab_list(self) -> list:
         return [self.cep_tab, self.blocking_tab, self.lm_tab]
+
+    def _focus_canvas(self, _index: int) -> None:
+        """A new tab: the story keys go to it (unless the tab bar is being driven by keys)."""
+        if not self.tabs.tabBar().hasFocus():
+            self.tabs.currentWidget().canvas.setFocus()
 
     # ─── Scenarios ───────────────────────────────────────────────────────────
 
@@ -2941,7 +3253,7 @@ class LabWindow(QMainWindow):
         receivers, world, env, heading, settings, limits = self._sim_parts()
         lib = self._sync_lib(limits)
         modes, offsets = self.panel.overrides()
-        env = env.copy(amp_jitter_db=0.0, tick_dither=False)
+        env = env.copy(amp_jitter_db=0.0, tick_dither=False, noise_rate_hz=0.0)
 
         def ping(states):
             for r, s in zip(receivers, states):
@@ -2992,8 +3304,25 @@ class LabWindow(QMainWindow):
         self.panel.set_overrides([mode.get(r.state, "clean") for r in self.sim.receivers],
                                  np.zeros(len(self.sim.receivers)))
 
-    def closeEvent(self, event) -> None:
-        self.blocking_tab.stop()
+    def follow_settings(self) -> None:
+        """Take up the simulator's solver settings if one the lab uses changed (an EKF
+        setting alone does not restart the stories or drop a sweep)."""
+        with self.lock:
+            settings = copy.copy(self.sim.solvers.settings)
+        old = self.scenario.settings if self.scenario is not None else None
+        if old is not None and any(getattr(settings, f) != getattr(old, f) for f in LAB_SETTINGS):
+            self._set_scenario(replace(self.scenario, settings=settings))
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self.follow_settings()
+
+    def hideEvent(self, event) -> None:
         for tab in self.tab_list:
             tab.player.pause()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self.blocking_tab.stop()
         super().closeEvent(event)

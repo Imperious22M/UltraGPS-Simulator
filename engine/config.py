@@ -12,6 +12,7 @@ Configuration files.
 from __future__ import annotations
 
 import os
+import warnings
 
 import numpy as np
 
@@ -47,14 +48,21 @@ def load_receivers(config_path: str, sensors_path: str) -> list[Receiver]:
 
 
 def load_world(world_path: str | None, coords) -> World:
-    """The room in world.toml, or walls 50 cm outside the receivers if there is none."""
+    """The room in world.toml, or walls 50 cm outside the receivers if there
+    is none.  An obstacle with no area (fewer than 3 distinct corners, or all
+    in a line) is skipped with a warning: it could block nothing."""
     if not world_path or not os.path.exists(world_path):
         return World(default_walls(coords, 50.0), 0.6, [])
     cfg   = load_config(world_path)
     walls = [tuple(map(float, p)) for p in cfg.get("walls", [])]
-    obs   = [Obstacle([tuple(map(float, p)) for p in o["points"]],
+    obs   = []
+    for k, o in enumerate(cfg.get("obstacles", [])):
+        ob = Obstacle([tuple(map(float, p)) for p in o["points"]],
                       float(o.get("reflectivity", 0.7)), str(o.get("name", "")))
-             for o in cfg.get("obstacles", [])]
+        if len(set(ob.points)) < 3 or ob.area < 1e-6:
+            warnings.warn(f"{world_path}: obstacle {ob.name or k + 1} has no area; skipped", stacklevel=2)
+        else:
+            obs.append(ob)
     return World(walls, float(cfg.get("wall_reflectivity", 0.6)), obs)
 
 

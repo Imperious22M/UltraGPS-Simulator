@@ -161,21 +161,25 @@ class CepTabTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.win.close()
 
-    def test_steps_are_the_filter_every_subset_and_validation(self):
+    def test_steps_are_the_filter_the_librarys_subsets_and_validation(self):
         tr = self.tab.trace
-        self.assertEqual(self.tab.player.count, 1 + len(tr.steps) + 1)
-        self.assertEqual(len(tr.steps), 42)            # every subset of 3+ of 6 receivers
-        self.assertEqual(self.tab.table.rowCount(), len(tr.steps))
+        self.assertEqual(self.win.scenario.settings.cep_subsets, "control")
+        self.assertEqual(len(tr.steps), 42)            # every subset of 3+ of 6 receivers is scored here ...
+        self.assertEqual(tr.searched, 15)              # ... but the library, as UltraGPS-Control calls it, stops at 15
+        self.assertEqual(self.tab.player.count, 1 + 15 + 1)
+        self.assertEqual(self.tab.table.rowCount(), 15)
 
     def test_the_winner_is_the_librarys(self):
         sc  = self.win.scenario
         lib = UltraGPSPositionLib(self.sim.config_path)
-        pos, cep, idx, _ = lib._find_best_subset(tuple(sc.distances), sc.sane, 2 ** 6)
+        pos, cep, idx, _ = lib._find_best_subset(tuple(sc.distances), sc.sane, 15)
         best = self.tab.trace.steps[self.tab.trace.best]
         self.assertEqual(best.subset, idx)
         self.assertAlmostEqual(best.cep, cep)
         np.testing.assert_allclose(self.tab.trace.position, pos)
         self.assertNotIn(2, idx)                       # the reading 25 cm long is left out
+        _, _, every, _ = lib._find_best_subset(tuple(sc.distances), sc.sane, 2 ** 6)
+        self.assertEqual(self.tab.trace.steps[self.tab.trace.best_all].subset, every)
 
     def test_chart_and_table_jump_to_a_subset(self):
         self.tab.chart.picked.emit(5)
@@ -197,7 +201,7 @@ class CepTabTest(unittest.TestCase):
         text = self.tab.text.toPlainText()
         for part in ("0.59", "JᵀWJ", num(s.cep), "1 / (|ri| + 0.1)"):
             self.assertIn(part, text)
-        self.assertIn(f"subset 8 of {len(self.tab.trace.steps)}", self.tab.bar.full_text)
+        self.assertIn(f"subset 8 of {self.tab.trace.searched}", self.tab.bar.full_text)
 
 
 class BlockingTabTest(unittest.TestCase):
@@ -234,7 +238,7 @@ class BlockingTabTest(unittest.TestCase):
         tab = win.blocking_tab
         tab.ensure_computed()
         tab.sweep_steps = 7
-        tab.rx.setCurrentIndex(tab.rx.findData(1))
+        tab.rx.setCurrentIndex(tab.rx.findData(0))       # R0 is in CEP's winner at offset 0
         tab.max_off.setValue(60)
         tab.run_sweep()
         self.assertIsNotNone(tab._worker)
@@ -246,8 +250,8 @@ class BlockingTabTest(unittest.TestCase):
         self.assertEqual(tab.player.count, 7)
         self.assertTrue(tab.b_sweep.isEnabled() and tab.run_button.isEnabled())
         switches = cep_switches(tab.sweep)
-        self.assertTrue(switches)                      # exact readings: CEP leaves R1 out at once
-        self.assertRegex(switches[0][2], r"^CEP drops R1 .*at \+\d+ cm$")
+        self.assertTrue(switches)                      # exact readings: CEP leaves R0 out at once
+        self.assertRegex(switches[0][2], r"^CEP drops R0 .*at \+\d+ cm$")
         win.close()
 
     def test_a_sweep_of_an_old_scenario_is_dropped(self):

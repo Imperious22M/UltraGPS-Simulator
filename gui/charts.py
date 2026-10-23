@@ -69,6 +69,7 @@ class ErrorChart(QWidget):
 
     LEFT, RIGHT, TOP, BOTTOM = 44, 70, 22, 20     # margins round the plot, px
     LOG_TOP = 1e4                                 # cm: the log axis stops here (100 m is just "lost")
+    MIN_LABEL_GAP = 8.0                           # px between end labels at the tightest
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -236,10 +237,14 @@ class ErrorChart(QWidget):
         close_run()
         draw.stroke(p, path, c, 1.3)
 
-    def _draw_end_labels(self, p, plot, series, Y) -> None:
-        """Each algorithm's key at the right end of its line, pushed apart so none
-        overlap; "↑" marks a line that ends above the top of the axis."""
-        pal, ends = theme.current, []
+    def _end_labels(self, plot, series, Y) -> list:
+        """Where each algorithm's key goes at the right end of its line:
+        ``[[y of the line's end, y of the label, text, algorithm, has a fix now]]``.
+        The labels are pushed apart so none overlap and none leave the plot's
+        height (the lin / log switch sits just above it); "↑" marks a line that
+        ends above the top of the axis.  When there is no room for them all,
+        the lines without a fix now go unlabelled."""
+        ends = []
         for k, v in series.items():
             idx = np.where(np.isfinite(v))[0]
             if len(idx):
@@ -248,17 +253,24 @@ class ErrorChart(QWidget):
                 text = f"{k} ↑" if y < plot.top() - 0.5 else k
                 y    = min(max(y, plot.top()), plot.bottom())
                 ends.append([y, y, text, k, idx[-1] == len(v) - 1])
+        top, bottom = plot.top() + 4, plot.bottom() + 4
+        if len(ends) > 1 and (bottom - top) / (len(ends) - 1) < self.MIN_LABEL_GAP:
+            ends = [e for e in ends if e[4]] or ends   # keep the live ones
         ends.sort()
-        gap = 11.0
-        for i in range(1, len(ends)):
+        gap = min(11.0, (bottom - top) / (len(ends) - 1)) if len(ends) > 1 else 11.0
+        for e in ends:
+            e[1] = max(e[1], top)
+        for i in range(1, len(ends)):                  # push down ...
             ends[i][1] = max(ends[i][1], ends[i - 1][1] + gap)
-        overflow = ends[-1][1] - (plot.bottom() + 4) if ends else 0
-        if overflow > 0:
-            for e in ends:
-                e[1] -= overflow
+        if ends and ends[-1][1] > bottom:              # ... and back up from the bottom where they ran out
+            ends[-1][1] = bottom
             for i in range(len(ends) - 2, -1, -1):
                 ends[i][1] = min(ends[i][1], ends[i + 1][1] - gap)
-        for y_line, y_lab, text, k, live in ends:
+        return ends
+
+    def _draw_end_labels(self, p, plot, series, Y) -> None:
+        pal = theme.current
+        for y_line, y_lab, text, k, live in self._end_labels(plot, series, Y):
             a = 1.0 if live else 0.45
             p.setPen(draw.pen(pal.algo[k], 1.0, 0.5 * a))
             p.drawLine(QPointF(plot.right() + 1, y_line), QPointF(plot.right() + 6, y_lab))
@@ -350,6 +362,12 @@ LEGEND      = (                # (text, colour key, tooltip)
 def arrival_colour(a) -> str:
     """Status colour of an arrival's path kind (another receiver's burst: crosstalk)."""
     return theme.current.status["crosstalk" if a.source != "TX" else KIND_STATUS[a.path.kind]]
+
+
+def same_arrival(a, b) -> bool:
+    """Is ``a`` the arrival ``b``?  After interference the hardware reports a
+    copy of the arrival the comparator fired on, with its own detection cycle."""
+    return b is not None and (a is b or (a.path is b.path and a.source == b.source))
 
 
 class EchoScope(QWidget):
@@ -592,7 +610,8 @@ class EchoScope(QWidget):
             if a.time_ms > t_end:
                 later.append(a)
                 continue
-            self._draw_stem(p, r, a, X, base, Ydb(a.ratio_db), hi, a is dropped_by)
+            self._draw_stem(p, r, a, X, base, Ydb(a.ratio_db), hi,
+                            drop if same_arrival(a, dropped_by) else None)
         if later:
             rect = draw.label(p, QPointF(plot.right() + 4, top + 5), f"+{len(later)}›",
                               pal.text_muted, 7, halo=False)
@@ -608,9 +627,19 @@ class EchoScope(QWidget):
         draw.stroke(p, draw.polyline_path(pts), sc, 1.3)
         if not falls:
             draw.arrow(p, QPointF(plot.right() - 12, hi), QPointF(plot.right() + 8, hi), sc, 1.3, 5)
-        if r.status in TIMEOUTS or not falls:
-            text = (f"timeout {drop:.0f} ms" if r.status in TIMEOUTS else
-                    "injected dropout: reads 0" if r.status == "dropout" else "never drops: reads 0")
+        if r.status == "noise" and falls:
+            self._draw_noise(p, i, X(drop), hi, lo, drop, sc)
+        timed_out = r.status in TIMEOUTS or (r.detected is None and drop is not None
+                                             and r.status != "noise")
+        if r.status == "noise":
+            text = f"noise {drop:.1f} ms"
+        elif timed_out:
+            text = f"timeout {drop:.0f} ms"
+        elif not falls:
+            text = "injected dropout: reads 0" if r.status == "dropout" else "never drops: reads 0"
+        else:
+            text = ""
+        if text:
             draw.label(p, QPointF(X(drop) - 4 if falls else plot.right() - 14, (hi + lo) / 2), text,
                        sc, 7, "right")
 
@@ -623,6 +652,16 @@ class EchoScope(QWidget):
                 self.hits.append((QRectF(x - 4, hi - 8, 8, lo - hi + 8),
                                    f"R{i}: true distance {r.true_cm:.1f} cm; an ideal receiver's "
                                    f"echo line would drop here, at {t:.2f} ms"))
+
+    def _draw_noise(self, p, i, x, hi, lo, t, c) -> None:
+        """A burst of noise where it dropped the echo line, with no sound arrival behind it."""
+        zig = QPainterPath(QPointF(x - 6, hi - 3))
+        for k in range(1, 7):
+            zig.lineTo(x - 6 + 2 * k, hi - 3 - (5 if k % 2 else 0))
+        draw.stroke(p, zig, c, 1.1, 0.9, glow=False)
+        self.hits.append((QRectF(x - 7, hi - 10, 14, lo - hi + 10),
+                          f"R{i}: ambient ultrasonic noise tripped the comparator at {t:.2f} ms, "
+                          "before any sound was detected: the reading is random and short"))
 
     def _draw_row_label(self, p, i, r, cell: QRectF, sc: str, two: bool) -> None:
         """"R2  echo" and the reading's error (measured − true): under it in a
@@ -645,14 +684,15 @@ class EchoScope(QWidget):
                            f"R{i} {r.status}: {STATUS.get(r.status, '')}\n"
                            f"measured {meas}, true {r.true_cm:.1f} cm, tick {r.tick}"))
 
-    def _draw_stem(self, p, r, a, X, base, y, hi, dropped: bool) -> None:
+    def _draw_stem(self, p, r, a, X, base, y, hi, drop_ms: float | None) -> None:
         """One arrival: a stem as tall as its strength, filled if it could be
-        detected, bold if the comparator fired on it.  ``dropped``: it is what
-        dropped the echo line, so a dotted link leads to where the line falls."""
+        detected, bold if the comparator fired on it.  ``drop_ms``: it is what
+        dropped the echo line, then, so a dotted link leads to where the line falls."""
         env      = self._env
         c        = arrival_colour(a)
         x        = X(a.time_ms)
-        detected = a is r.detected
+        detected = same_arrival(a, r.detected)
+        dropped  = drop_ms is not None
         heard    = a.time_ms >= env.rx_ready_ms
         alpha    = 1.0 if heard else 0.4
         stem     = QPainterPath(QPointF(x, base))
@@ -661,7 +701,7 @@ class EchoScope(QWidget):
         draw.marker(p, QPointF(x, y), "circle", c, 6.0 if detected else 4.5, 1.2, alpha,
                     fill=0.0 if a.cycle is None else 1.0)
         if dropped:
-            fall = QPointF(X(a.detect_ms), hi)
+            fall = QPointF(X(drop_ms), hi)
             link = QPainterPath(QPointF(x, base))
             link.lineTo(fall)
             draw.stroke(p, link, c, 1.0, 0.8, draw.DOT, glow=False)
@@ -693,12 +733,17 @@ class EchoScope(QWidget):
         else:
             lines.append(f"crosses the threshold on cycle {a.cycle} "
                          f"(+{a.cycle * ac.CYCLE_MS * 1000:.0f} µs)")
-        if dropped:
+        if dropped and r.status == "fade":
+            lines.append(f"→ this arrival, added in or out of phase to the ones overlapping it, "
+                         f"dropped the echo line at {r.echo_ms:.3f} ms (interference)")
+        elif dropped:
             lines.append("→ this arrival dropped the echo line")
-        elif a is r.detected:
+        elif same_arrival(a, r.detected):
             lines.append(f"→ detected, but an injected fault ({r.status}) replaced the reading")
         elif not heard and a.cycle is not None:
             lines.append(f"not heard: arrived before the receiver listens ({env.rx_ready_ms:.1f} ms)")
         elif a.cycle is not None and r.detected is not None:
             lines.append("not used: the echo line had already dropped")
+        elif a.cycle is not None and r.status == "noise":
+            lines.append("not used: noise had already dropped the echo line")
         return "\n".join(lines)

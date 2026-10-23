@@ -88,6 +88,53 @@ class SolverTest(unittest.TestCase):
         f = sim.step()
         self.assertTrue(f.estimates["EKF"].note.startswith("gated"))
 
+    def test_bias_covariance_matches_its_scatter(self):
+        # Three unknowns (x, y, offset): s² over m − 3 and a three-column Jacobian
+        lib, d = lib_and_ranges((90.0, 150.0))
+        rng = np.random.default_rng(1)
+        pos, var = [], []
+        for _ in range(400):
+            est = S.solve_bias(lib, d + rng.normal(0, 3, 6), [0, 1, 2, 4, 5])
+            pos.append(est.pos)
+            var.append(np.diag(est.cov))
+        ratio = np.std(pos, axis=0) / np.sqrt(np.mean(var, axis=0))
+        np.testing.assert_allclose(ratio, 1.0, atol=0.12)
+
+    def test_cep_ellipse_is_a_position_covariance(self):
+        # The library's (JᵀWJ)⁻¹ barely grows with noise; the ellipse must follow the real scatter
+        lib, d = lib_and_ranges()
+        off = lib._offsets
+        rng = np.random.default_rng(2)
+        for noise in (1.0, 5.0):
+            solvers = S.Solvers(DEFAULT_CONFIG)
+            err2, var = [], []
+            for _ in range(200):
+                dd    = d + rng.normal(0, noise, 6)
+                ticks = [round((v - off[i]["intercept"]) / off[i]["slope"]) for i, v in enumerate(dd)]
+                e     = solvers.solve(ticks, only=set()).estimates["CEP"]
+                if e.ok:
+                    err2.append(np.sum((e.pos - [30.0, 50.0]) ** 2))
+                    var.append(np.trace(e.cov))
+            self.assertGreater(len(err2), 150)
+            ratio = np.sqrt(np.mean(err2) / np.mean(var))
+            self.assertTrue(0.6 < ratio < 1.6, (noise, ratio))
+        np.testing.assert_array_equal(e.score_cov, solvers.lib._cep_last_good_cov)   # the library's own
+
+    def test_cep_says_when_it_has_no_fix_to_hold(self):
+        sim = ideal_sim(noise=0.5)
+        for i in (0, 1, 2, 3):
+            sim.set_receiver_state(i, "off")
+        f = run(sim, [30, 50], frames=1)                   # nothing solved yet, nothing to hold
+        self.assertEqual((f.estimates["LM"].note, f.estimates["CEP"].note), ("needs 3 receivers",) * 2)
+        for i in (0, 1, 2, 3):
+            sim.set_receiver_state(i, "on")
+        f = run(sim, [150, 0], frames=3)                   # outside the receivers' box from the start
+        self.assertFalse(f.estimates["CEP"].ok)
+        self.assertEqual(f.estimates["CEP"].note, "outside the box: rejected (no earlier fix to hold)")
+        run(sim, [30, 50], frames=10)
+        f = run(sim, [150, 0], frames=10)
+        self.assertEqual(f.estimates["CEP"].note, "outside the box: holding last fix")
+
     def test_bounds_filter_mode_lets_simulator_algorithms_see_more(self):
         sim = ideal_sim(noise=0.0)
         sim.solvers.settings.filter_mode = "bounds"
@@ -166,17 +213,18 @@ class RecordingTest(unittest.TestCase):
         sim = ideal_sim(noise=1.0)
         sim.motion.set_mode("circle")
         sim.start_recording()
-        for _ in range(10):
-            sim.step()
-        frames = sim.stop_recording()
+        frames = [sim.step() for _ in range(10)]
+        self.assertEqual(len(sim.recording), 10)
+        records = sim.stop_recording()
         tmp = tempfile.mkdtemp()
         csv_path, log_path = os.path.join(tmp, "run.csv"), os.path.join(tmp, "ticks.txt")
-        sim.save_csv(frames, csv_path)
-        sim.save_ticks(frames, log_path)
+        sim.save_csv(records, csv_path)
+        sim.save_ticks(records, log_path)
         with open(log_path) as fh:
             self.assertTrue(fh.readline().startswith("C: "))
         for path, truth in ((csv_path, True), (log_path, False)):
             sim.load_replay(path)
+            self.assertEqual(sim.replay.skipped, 0)
             replayed = [sim.step() for _ in range(10)]
             self.assertEqual([f.ticks for f in replayed], [f.ticks for f in frames])
             self.assertEqual(replayed[0].true is not None, truth)
@@ -203,11 +251,66 @@ class MotionTest(unittest.TestCase):
         for _ in range(60):
             sim.step()
             self.assertFalse(box.contains(sim.true))
-        self.assertLess(sim.true[0], -39)            # stopped at its edge
+        self.assertAlmostEqual(sim.true[0], -40.5, delta=1e-6)   # stopped just short of its edge
         sim.motion.set_mode("random")
         for _ in range(200):
             sim.step()
             self.assertFalse(box.contains(sim.true))
+
+    def test_transmitter_does_not_jump_across_thin_obstacles(self):
+        sim = ideal_sim()
+        panel = Obstacle.rect(0, -120, 2, 120)
+        sim.world.obstacles = [panel]
+        sim.place((-20, 0))
+        sim.speed = 300.0                             # 30 cm a frame, the panel is 2 cm thick
+        sim.motion.go_to((60, 0))
+        for _ in range(10):
+            sim.step()
+        self.assertAlmostEqual(sim.true[0], -0.5, delta=1e-6)
+        board = Obstacle.rect(-3, 40, 3, 160)         # circle mode catches up at 10 cm a frame
+        sim.world.obstacles = [board]
+        sim.place((0, 0))
+        sim.speed = 50.0
+        sim.motion.set_mode("circle")
+        side = None
+        for _ in range(200):
+            sim.step()
+            self.assertFalse(board.contains(sim.true))
+            if 40 < sim.true[1] < 160:
+                now = sim.true[0] > 0
+                self.assertIn(side, (None, now))      # never changes sides beside the board
+                side = now
+            else:
+                side = None
+
+    def test_transmitter_inside_an_obstacle_drives_out(self):
+        for mode in ("target", "circle", "figure8", "random", "lawnmower"):
+            sim = ideal_sim(seed=1)
+            sim.place((0, 0))
+            box = Obstacle.rect(-30, -30, 30, 30)
+            sim.world.obstacles = [box]               # drawn over the transmitter
+            if mode == "target":
+                sim.motion.go_to((100, 100))
+            else:
+                sim.motion.set_mode(mode)
+            for _ in range(30):
+                sim.step()
+            self.assertFalse(box.contains(sim.true), mode)
+
+    def test_place_moves_a_point_out_of_an_obstacle(self):
+        sim = ideal_sim()
+        box = Obstacle.rect(-30, -30, 30, 30)
+        sim.world.obstacles = [box]
+        sim.place((0, 5))                             # nearest edge: y = 30
+        np.testing.assert_allclose(sim.true, [0, 31])
+        np.testing.assert_allclose(sim.target, [0, 31])
+        sim.place((100, 5))                           # outside: exactly where asked
+        np.testing.assert_allclose(sim.true, [100, 5])
+        tilted = Obstacle([(0, -40), (40, 0), (0, 40), (-40, 0)])
+        sim.world.obstacles = [tilted]
+        sim.place((5, 5))
+        self.assertFalse(tilted.contains(sim.true))
+        self.assertAlmostEqual(abs(sim.true[0]) + abs(sim.true[1]), 40 + np.sqrt(2), delta=1e-6)
 
 
 if __name__ == "__main__":

@@ -2,17 +2,18 @@
 Panels — the control panels docked round the arena.
 
 Each panel takes ``(sim, runner)``, writes every change straight into the
-simulation and has ``refresh(frame)``, which the main window calls for each
-new frame to update read-outs and to pick up changes made elsewhere.
+simulation, emits ``edited`` when the user has changed something, and has
+``refresh(frame)``, which the main window calls for each new frame to update
+read-outs and to pick up changes made elsewhere.
 
 Most controls are rows of a ``ParamForm``, built from a table of ``Field``s:
 a number is a slider and a spin box kept in step, a bool a check box, a choice
 a combo box.  The tables below are also where each setting's tooltip lives.
 
 Writes follow the runner's rule: an ``Environment`` or ``Faults`` change swaps
-in a new object in one assignment; anything needing several assignments holds
-``runner.lock``.  Reads never take the lock, so the windows never wait for a
-frame to finish.
+in a new object in one assignment; anything needing several assignments goes
+through ``runner.post``, which applies it between two steps without waiting.
+Reads never take the lock, so the windows never wait for a frame to finish.
 """
 
 from __future__ import annotations
@@ -97,6 +98,10 @@ class SliderSpin(QWidget):
         widest = max((f"{v:.{decimals}f}{self.spin.suffix()}" for v in (lo, hi)), key=len)
         self.spin.setFixedWidth(self.spin.fontMetrics().horizontalAdvance(widest) + 16)
         _wheel_needs_focus(self.slider, self.spin)
+        self._typing = False                          # text typed in the box, not yet committed
+        # Bound methods: lambdas holding self here kept whole panels alive after they were dropped
+        self.spin.lineEdit().textEdited.connect(self._typed)
+        self.spin.editingFinished.connect(self._committed)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
@@ -117,8 +122,15 @@ class SliderSpin(QWidget):
             w.blockSignals(False)
 
     def editing(self) -> bool:
-        """True while the user is dragging the slider or typing in the box."""
-        return self.slider.isSliderDown() or self.spin.hasFocus()
+        """True while the user is dragging the slider or has typed in the box
+        without pressing Enter yet (a box merely holding the focus shows changes)."""
+        return self.slider.isSliderDown() or self._typing
+
+    def _typed(self, _text: str) -> None:
+        self._typing = True
+
+    def _committed(self) -> None:
+        self._typing = False
 
     def setToolTip(self, text: str) -> None:
         for w in (self, self.slider, self.spin):
@@ -239,6 +251,8 @@ class _Panel(QWidget):
     scrolling body (``self.body``, a vertical layout), and shows the last frame
     again when the palette changes, since ``refresh`` colours table cells and
     icons with the palette's colours."""
+
+    edited = pyqtSignal()                      # the user changed a setting here
 
     _restyling = False
 
@@ -449,6 +463,7 @@ class ScenarioPanel(_Panel):
         super().__init__(sim, runner, parent)
         lay = self.body
         self.form = ParamForm(SCENARIO_FIELDS, self._get, self._set)
+        self.form.changed.connect(self.edited)
         align_spins(self.form)
         lay.addWidget(self.form)
         lay.addWidget(_label("Click the arena to send the transmitter to a point.", "dim"))
@@ -481,8 +496,7 @@ class ScenarioPanel(_Panel):
 
     def _set(self, attr, value) -> None:
         if attr == "mode":
-            with self.runner.lock:
-                self.sim.motion.set_mode(value)
+            self.runner.post(lambda: self.sim.motion.set_mode(value))
         elif attr in ("speed", "radius"):
             setattr(self.sim.motion, attr, value)
         elif attr == "dt":
@@ -559,13 +573,14 @@ class ReceiverPanel(_Panel):
                 hl.setContentsMargins(0, 0, 0, 0)
                 hl.addWidget(rb, 0, Qt.AlignmentFlag.AlignCenter)
                 t.setCellWidget(2 * i + 1, j, holder)
-            group.idClicked.connect(lambda j, i=i: self.sim.set_receiver_state(i, STATES[j]))
+            group.idClicked.connect(lambda j, i=i: self._set_state(i, STATES[j]))
             self.groups.append(group)
         _fit_height(t)
         lay.addWidget(t)
 
         self.survey = ParamForm([Field("sigma", "Survey error σ", "float", 0, 20, 0.5, "cm", SURVEY_TIP)],
                                 lambda _: self._sigma, self._set_sigma)
+        self.survey.changed.connect(self.edited)
         reroll = QPushButton("Re-roll")
         reroll.setToolTip("Draw new random survey errors of the same size σ.")
         reroll.clicked.connect(self._reroll)
@@ -578,14 +593,18 @@ class ReceiverPanel(_Panel):
         self.refresh(None)
 
     def _set_sigma(self, _attr, sigma: float) -> None:
-        self._sigma = sigma
-        with self.runner.lock:
-            self.sim.survey_error(sigma, seed=self._seed)
+        self._sigma, seed = sigma, self._seed
+        self.runner.post(lambda: self.sim.survey_error(sigma, seed=seed))
         self._show_offset()
+
+    def _set_state(self, i: int, state: str) -> None:
+        self.sim.set_receiver_state(i, state)
+        self.edited.emit()
 
     def _reroll(self) -> None:
         self._seed += 1
         self._set_sigma("sigma", self._sigma)
+        self.edited.emit()
 
     def _show_offset(self) -> None:
         """How far the receivers really are from config.toml's positions (the
@@ -614,11 +633,11 @@ class ReceiverPanel(_Panel):
         sol      = frame.solution
         cep_used = {int(k) for k in frame.estimates["CEP"].used} if "CEP" in frame.estimates else set()
         for i in range(len(self.groups)):
-            r      = frame.readings[i] if frame.readings else None      # none when replaying
+            r      = frame.readings[i] if i < len(frame.readings) else None      # none when replaying
             status = r.status if r else "log"
             true   = self._true_distance(i, r, frame)
-            tick   = frame.ticks[i]
-            dist   = sol.distances[i]
+            tick   = frame.ticks[i] if i < len(frame.ticks) else 0               # a short replayed row
+            dist   = sol.distances[i] if i < len(sol.distances) else float("nan")
             err    = dist - true if tick > 0 else float("nan")
             kept   = i in sol.sane
             det    = r.detected if r else None
@@ -628,7 +647,7 @@ class ReceiverPanel(_Panel):
             head.setIcon(_icon("dot", sc))
             row    = 2 * i + 1
             _cell(t, row, 3, str(tick), pal.text if tick else pal.text_muted)
-            _cell(t, row, 4, f"{dist:.0f}", pal.text if i in sol.inbounds else pal.text_muted)
+            _cell(t, row, 4, _num(dist, 0), pal.text if i in sol.inbounds else pal.text_muted)
             _cell(t, row, 5, _num(true, 0), pal.text_dim)
             _cell(t, row, 6, _num(err, signed=True),
                   pal.text_muted if not math.isfinite(err) else pal.status["ok"] if abs(err) <= 2
@@ -650,6 +669,15 @@ ALGO_COLUMNS = (
 )
 
 SOLVER_FIELDS = [
+    Field("cep_subsets", "CEP subsets", "choice",
+          choices=(("control", "First 15, as UltraGPS-Control"), ("all", "All (42 with six receivers)")),
+          tip="How many receiver subsets the library's CEP tries. First 15: the library's default "
+              "max_subsets, which UltraGPS-Control uses: all the kept receivers together, then the "
+              "three-receiver subsets in order (larger ones only after every triple), until 15 have "
+              "been tried. With six receivers that is all six plus 14 of the 20 triples: no 4- or "
+              "5-receiver subset, and 27 of the 42 subsets in all, is ever tried. All: every subset of "
+              "three or more kept receivers (42 with six), slower, but the best-scoring subset is "
+              "never missed."),
     Field("filter_mode", "Receivers used", "choice",
           choices=(("library", "Library filter"), ("bounds", "Bounds only")),
           tip="Which receivers the simulator-only algorithms (CEP4, ROBUST, BIAS, RANSAC) get. "
@@ -703,6 +731,7 @@ class AlgorithmPanel(_Panel):
         self._stats   = {k: (nan, nan, nan, 0) for k in theme.ALGO_ORDER}
         self.settings = ParamForm(SOLVER_FIELDS, lambda a: getattr(sim.solvers.settings, a),
                                   lambda a, v: setattr(sim.solvers.settings, a, v))
+        self.settings.changed.connect(self.edited)
         align_spins(self.settings)
         reset = QPushButton("Reset stats")
         reset.setToolTip("Clear the error statistics, trails and every solver's memory (the library's "
@@ -724,9 +753,9 @@ class AlgorithmPanel(_Panel):
         self.shownChanged.emit(self.shown)
 
     def _reset(self) -> None:
-        with self.runner.lock:
-            self.sim.reset()
+        self.runner.post(self.sim.reset)
         self.refresh(None)
+        self.edited.emit()
 
     def _read_stats(self) -> dict:
         """``sim.stats`` of every algorithm, read without the runner's lock; a
@@ -812,6 +841,18 @@ ENV_GROUPS = [
                   "15° claim rather than the real beam."),
         Field("fov_half_deg", "Field of view ±", "float", 1, 90, 0.5, "°",
               tip="Half-width of the hard field of view.", needs=lambda v: v("fov_cutoff")),
+        Field("gain_spread_db", "Module spread", "float", 0, 6, 0.1, "dB",
+              tip="No two HC-SR04 modules are quite alike: each receiver's sensitivity is off the "
+                  "nominal by a random amount with this standard deviation, drawn once per receiver. "
+                  "A less sensitive module detects later (more range walk) and loses weak signals "
+                  "first. Applies with threshold detection on.",
+              needs=lambda v: v("threshold")),
+        Field("aim_spread_deg", "Aim spread", "float", 0, 20, 0.5, "°",
+              tip="Each receiver is mounted a little off its nominal facing: a random angle with this "
+                  "standard deviation, drawn once per receiver. Turns its beam pattern and field of "
+                  "view (the arena draws the lobes where they really point). Applies with beam "
+                  "patterns or the hard field of view on.",
+              needs=lambda v: v("beam_patterns") or v("fov_cutoff")),
     ]),
     ("Detection", [
         Field("threshold", "Threshold detection", "bool",
@@ -831,6 +872,17 @@ ENV_GROUPS = [
         Field("amp_jitter_db", "Turbulence", "float", 0, 6, 0.1, "dB",
               tip="Random ping-to-ping change in strength from air turbulence and small movements. "
                   "Makes marginal arrivals flicker between detected, late and lost."),
+        Field("interference", "Interference", "bool",
+              tip="Arrivals that reach a receiver within one burst of each other (the direct sound "
+                  "and a short echo off a nearby wall) add up in or out of phase before the "
+                  "comparator sees them, so the line can drop late, early or not at all (status "
+                  "'fade'). Off: each arrival is detected on its own. Applies with threshold "
+                  "detection on.", needs=lambda v: v("threshold")),
+        Field("noise_rate_hz", "Ambient noise", "float", 0, 20, 0.1, "/s",
+              tip="Ultrasonic noise in the room (air leaks, jangling keys, other ultrasonic devices): "
+                  "how often, per second of listening, a noise burst trips a receiver's comparator. "
+                  "One that comes before the sound drops the echo line early: a random, short "
+                  "reading (status 'noise')."),
         Field("ref_distance_cm", "Calibrated range", "float", 20, 400, 5, "cm",
               tip="Detection always takes a cycle or so; the delay of an on-axis burst at this "
                   "distance is absorbed by the calibration. Only range walk beyond it shows as error.",
@@ -921,6 +973,7 @@ class EnvironmentPanel(_Panel):
         for title, fields in ENV_GROUPS:
             form = ParamForm(fields, lambda a: getattr(self.sim.env, a), self._set)
             form.changed.connect(lambda *_: self.refresh(None))
+            form.changed.connect(self.edited)
             self.forms.append(form)
             lay.addWidget(_group(title, form))
         lay.addStretch(1)
@@ -935,6 +988,7 @@ class EnvironmentPanel(_Panel):
         if name in PRESETS:
             self.sim.env = Environment(**PRESETS[name])
         self.refresh(None)
+        self.edited.emit()
 
     def refresh(self, frame) -> None:
         env = self.sim.env
@@ -994,6 +1048,8 @@ class FaultsPanel(_Panel):
                                     "muted")))
         self.filter = ParamForm(FILTER_FIELDS, self._get_filter,
                                 lambda a, v: setattr(self.sim.solvers.lib, a, v))
+        for form in (self.faults, self.filter):
+            form.changed.connect(self.edited)
         lay.addWidget(_group("Library filter", self.filter))
         lay.addStretch(1)
         align_spins(self.faults, self.filter)

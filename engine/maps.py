@@ -2,10 +2,12 @@
 Maps — one number for every point of the arena, to see where the positioning
 system works and why.  Pure numpy over the engine, no GUI code.
 
-    coverage       receivers whose direct sound is strong enough to detect
+    coverage       receivers whose direct sound, on its own, is strong enough
+                   to detect before the module or the base station gives up
     first_arrival  receivers that would time something other than the direct
                    sound: a reflection, sound bent round an obstacle, another
-                   receiver's burst, or nothing at all
+                   receiver's burst, the direct sound shifted or cancelled by
+                   an overlapping echo (fade), or nothing at all
     hdop           horizontal dilution of precision of the covered receivers:
                    cm of position error per cm of range error
     bias           mean range error |measured − true| with no noise: range
@@ -19,19 +21,20 @@ covering the box of the receivers (where config.toml says they are) plus
 obstacle or outside the walls), ``inf`` a point with no fix.
 
 The first four are deterministic: amplitude turbulence, timing jitter, radio
-loss, near-receiver noise and injected faults are switched off, so they show
-the physics alone.  ``accuracy`` pings each point ``trials`` times with all of
-it on, as the simulation does.  A transmitter set to face its heading faces
-the simulation's current heading everywhere.
+loss, ambient noise, near-receiver noise and injected faults are switched off,
+so they show the physics alone (each receiver keeps its module's gain and aim
+spread, which do not change from ping to ping).  ``accuracy`` pings each point
+``trials`` times with all of it on, as the simulation does.  A transmitter set
+to face its heading faces the simulation's current heading everywhere.
 
 Runtime on one core with 6 receivers and the default room, 10 cm grid (about
 1300 points): ``coverage`` and ``hdop`` about 1 s, ``first_arrival`` and
 ``bias`` about 5 s.  ``accuracy`` costs points × trials × (about 2 ms per ping
 + the algorithm): at 20 cm and 10 trials, about 10 s for OLS or LM, 30 s for
-CEP4 or RANSAC and 2 minutes for the library's CEP (42 subsets a fix).
-Everything runs on the calling thread: ``progress(fraction)`` is called after
-each point and ``cancel()`` checked before each; when it returns true the
-computation stops by raising ``Cancelled``.
+CEP4 or RANSAC and 1-2 minutes for the library's CEP.  Everything runs on the
+calling thread: ``progress(fraction)`` is called after each point and
+``cancel()`` checked before each point and each of ``accuracy``'s pings; when
+it returns true the computation stops by raising ``Cancelled``.
 """
 
 from __future__ import annotations
@@ -51,7 +54,7 @@ from ultragps_position import UltraGPSPositionLib
 
 MARGIN_CM = 30.0                                    # grid reaches this far outside the receivers
 DIRECT    = ("ok", "walk", "near")                  # reading statuses that timed the direct sound
-HEARD     = DIRECT + ("echo", "bent", "crosstalk")  # ... that timed some sound
+HEARD     = DIRECT + ("echo", "bent", "crosstalk", "fade")   # ... that may have timed some sound
 ALGORITHMS = ("OLS", "LM", "CEP", "CEP4", "ROBUST", "BIAS", "RANSAC")   # snapshot algorithms (no EKF)
 
 
@@ -147,7 +150,8 @@ def bias(sim, step: float = 10.0, progress=None, cancel=None):
     hw = _steady_hardware(sc)
 
     def mean_error(p):
-        errs = [abs(r.measured_cm - r.true_cm) for r in hw.measure(p, sc.heading) if r.status in HEARD]
+        errs = [abs(r.measured_cm - r.true_cm) for r in hw.measure(p, sc.heading)
+                if r.status in HEARD and r.detected is not None]
         return float(np.mean(errs)) if errs else math.inf
     return _map(sc, step, mean_error, progress, cancel)
 
@@ -173,6 +177,8 @@ def accuracy(sim, algorithm: str = "LM", trials: int = 10, step: float = 20.0, p
     def rms(p):
         errs = []
         for _ in range(trials):
+            if cancel is not None and cancel():        # a CEP point can take seconds
+                raise Cancelled()
             ticks = [r.tick for r in hw.measure(p, sc.heading)]
             d     = np.array(lib._ticks_to_distances(ticks), dtype=float)
             idx   = [i for i, v in enumerate(d) if 0 < v <= top]
@@ -189,7 +195,8 @@ def solve(lib: UltraGPSPositionLib, d: np.ndarray, idx: list, algorithm: str,
           settings: S.Settings | None = None) -> S.Estimate:
     """One snapshot algorithm on distances ``d`` from receivers ``idx``, as
     ``lab.static_solve`` runs it.  ``static_solve`` runs all seven (about 55 ms,
-    most of it the library's CEP); a map needs thousands of fixes of one."""
+    most of it the library's CEP); a map needs thousands of fixes of one.  The
+    library's CEP tries as many subsets as ``settings.cep_subsets`` allows."""
     s = settings or S.Settings()
     if algorithm == "CEP4":
         return S.solve_cep4(lib, d, idx)
@@ -207,9 +214,11 @@ def solve(lib: UltraGPSPositionLib, d: np.ndarray, idx: list, algorithm: str,
         pos, r = lib._multilaterate(tuple(d), np.array(idx))
         return S.Estimate(np.array(pos), bool(r.success), list(idx))
     if algorithm == "CEP":
-        pos, _, used, cov = lib._find_best_subset(tuple(d), list(idx), 2 ** lib.receiver_count)
+        pos, _, used, score = lib._find_best_subset(tuple(d), list(idx),
+                                                    S.cep_max_subsets(s, lib.receiver_count))
         _, outside = lib._validate_position(pos)
-        return S.Estimate(None if pos is None else np.array(pos), not outside, list(used or []), cov)
+        return S.Estimate(None if pos is None else np.array(pos), not outside, list(used or []),
+                          score_cov=score)
     raise ValueError(f"no snapshot algorithm {algorithm!r}")
 
 
@@ -235,29 +244,33 @@ def _map(sc: Scene, step: float, value, progress, cancel):
 def _steady_hardware(sc: Scene) -> Hardware:
     """Hardware with every random effect off, so each point reads the same every ping."""
     env = sc.env.copy(amp_jitter_db=0.0, sync_jitter_us=0.0, radio_loss=0.0, tick_dither=False,
-                      near_noise=False)
+                      near_noise=False, noise_rate_hz=0.0)
     return Hardware(sc.receivers, sc.world, env, Faults(noise_cm=0.0), seed=0)
 
 
 def _hears_direct(hw: Hardware, rx, p, tx_facing) -> bool:
-    """Is ``rx``'s direct sound from ``p`` detectable?  Off, blocked or a wall
-    or obstacle in the way: no."""
+    """Is ``rx``'s direct sound from ``p`` detectable on its own, while the
+    module listens and the base station samples?  Off, blocked or a wall or
+    obstacle in the way: no."""
     e = hw.env
     if rx.state == "off":
         return False
-    direct = hw.world.paths(p, rx.position, max_order=0, diffraction=False, direct=rx.state == "on")
+    direct = hw.world.paths(p, rx.position, max_order=0, diffraction=False, direct=rx.state == "on",
+                            wavelength=ac.wavelength_cm(e.temperature_c, e.humidity_pct))
     if not direct:
         return False
     path = direct[0]
     if e.fov_cutoff and not hw._in_fov(path, rx):
         return False
-    fired_ms = e.burst_lead_ms + e.sync_offset_us / 1000.0
-    if fired_ms + hw._travel_ms(path) < e.rx_ready_ms:      # here before the receiver listens
+    arrive = e.burst_lead_ms + e.sync_offset_us / 1000.0 + hw._travel_ms(path)
+    if arrive < e.rx_ready_ms:                                # here before the receiver listens
         return False
     if not e.threshold:
-        return path.length <= e.max_range_cm
-    ratio = 10.0 ** (hw.strength_db(path, tx_facing, rx.facing_deg) / 20.0)
-    return ac.detect_cycle(ratio, e.rise_cycles) is not None
+        cycle = 0 if path.length <= e.max_range_cm else None
+    else:
+        cycle = ac.detect_cycle(10.0 ** (hw.rx_strength_db(path, tx_facing, rx) / 20.0), e.rise_cycles)
+    give_up = min(e.rx_ready_ms + e.timeout_ms, e.window_ms)
+    return cycle is not None and arrive + cycle * ac.CYCLE_MS <= give_up
 
 
 def _remember_paths(world: World) -> World:

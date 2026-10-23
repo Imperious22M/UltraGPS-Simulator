@@ -12,19 +12,48 @@ See MANUAL.md (Help > Manual) for what everything does.
 
 renders the window after a number of frames and exits (no display needed with
 QT_QPA_PLATFORM=offscreen).
+
+An exception nothing catches is printed and shown in the status bar; the
+simulator carries on rather than quit.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
+import traceback
 
+from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from engine.config import DEFAULT_CONFIG, DEFAULT_SENSORS, DEFAULT_WORLD
 from engine.hardware import PRESETS, Environment
 from engine.simulation import Simulation
 from gui import theme
+
+
+class ErrorReporter(QObject):
+    """Carries the traceback of an exception nothing caught to the GUI thread."""
+
+    raised = pyqtSignal(str)
+
+
+def install_excepthook(win) -> ErrorReporter:
+    """Print any exception nothing caught and show it in ``win``'s status bar,
+    instead of letting PyQt abort the application (its default for one raised
+    in a slot or a thread).  The hook runs in the thread that raised, so it
+    only emits a signal; the window shows the error in the GUI thread."""
+    reporter = ErrorReporter(win)
+    reporter.raised.connect(win.show_error)
+
+    def hook(kind, value, tb) -> None:
+        text = "".join(traceback.format_exception(kind, value, tb))
+        sys.stderr.write(text)
+        reporter.raised.emit(text)
+
+    sys.excepthook = hook
+    return reporter
 
 
 def main() -> None:
@@ -52,6 +81,7 @@ def main() -> None:
     sim = Simulation(args.config, args.sensors, args.world, args.max_differential, args.max_distance,
                      seed=args.seed, env=Environment(**PRESETS[args.preset]))
     win = MainWindow(sim, args.config, restore=not args.screenshot)
+    install_excepthook(win)
     if args.palette:
         win.set_palette(args.palette)
 
@@ -60,12 +90,20 @@ def main() -> None:
         win.resize(w, h)
         win.show()
         sim.motion.set_mode(args.motion)
-        win.runner.paused = True
+        win.runner.paused = True              # the runner thread is not started: the frames are made here
         for _ in range(args.frames):
             win.on_frame(sim.step(win.runner.dt))
+        # The last one as a running simulator shows it: no PAUSED, 1x real time
+        win.runner.paused    = False
+        win.runner.real_rate = 1.0 / win.runner.dt
+        end = time.perf_counter() + 0.2       # past the panels' 0.1 s refresh limit
+        while time.perf_counter() < end:
+            app.processEvents()
+            time.sleep(0.01)
+        win.on_frame(sim.last)
         app.processEvents()
-        win.arena.set_frame(sim.last)
         win.grab().save(args.screenshot)
+        win.remove_key_filter()               # the window stays open, and the application goes first
         return
 
     win.show()

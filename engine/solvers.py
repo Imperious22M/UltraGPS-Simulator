@@ -1,14 +1,20 @@
 """
 Solvers — every positioning algorithm, run on the same frame of ticks.
 
-From the real ``ultragps_position`` library, unchanged, called exactly as
+From the real ``ultragps_position`` library, unchanged, called as
 UltraGPS-Control's position window calls it (``get_position_full``):
 
   OLS     the linear least-squares seed (``_ols``)
   LM      OLS seed refined by Levenberg-Marquardt
-  CEP     the receiver subset with the smallest Circular Error Probable.  The
-          library's default stops after 15 subsets; the simulator raises
-          ``max_subsets`` so every subset of 3 or more kept receivers is tried.
+  CEP     the receiver subset with the smallest Circular Error Probable.  With
+          ``Settings.cep_subsets = "control"`` (the default) the search stops
+          after 15 subsets, the library default UltraGPS-Control uses: all the
+          kept receivers, then the first 14 three-receiver subsets.  With
+          ``"all"`` every subset of 3 or more kept receivers is tried (42 with
+          six).  The library's matrix (JᵀWJ)⁻¹ is a ranking score, not a
+          position covariance: it is kept as ``Estimate.score_cov``, and
+          ``Estimate.cov`` is the winning subset's geometry scaled by the noise
+          LM sees over every kept receiver.
 
 Simulator-only algorithms, for comparison.  They are built from the library's
 own ``_ols`` / ``_nlls`` and range equation ``|p − rᵢ| = dᵢ`` where they can be,
@@ -34,10 +40,10 @@ The EKF always uses bounds only: its gate replaces the jump filter.
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass, field
 from itertools import combinations
-from math import comb
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -59,7 +65,7 @@ class AlgoInfo:
 ALGORITHMS = {a.key: a for a in (
     AlgoInfo("OLS",    "Linear least squares",       "library",   "Linearised ranges, one matrix solve. The seed for LM and CEP."),
     AlgoInfo("LM",     "Levenberg-Marquardt",        "library",   "OLS seed refined by non-linear least squares over every kept receiver."),
-    AlgoInfo("CEP",    "CEP best subset",            "library",   "Every subset of 3+ kept receivers; smallest Circular Error Probable wins; must lie in the receivers' box."),
+    AlgoInfo("CEP",    "CEP best subset",            "library",   "Subsets of 3+ kept receivers (the first 15, as UltraGPS-Control, or all); smallest Circular Error Probable wins; must lie in the receivers' box."),
     AlgoInfo("CEP4",   "CEP, 4+ receivers",          "simulator", "Subsets of 4+ only, textbook CEP from s²(JᵀJ)⁻¹, no bounding-box rejection."),
     AlgoInfo("ROBUST", "Robust LM (soft-L1)",        "simulator", "One fit with a loss that grows linearly for large residuals, so outliers count for less."),
     AlgoInfo("BIAS",   "LM + common offset",         "simulator", "Solves x, y and a range offset shared by every receiver (trigger timing). Needs 4."),
@@ -76,11 +82,17 @@ class Estimate:
     used: list = field(default_factory=list)
     cov: np.ndarray | None = None   # 2×2 position covariance, cm²
     note: str = ""
+    score_cov: np.ndarray | None = None   # CEP only: the library's (JᵀWJ)⁻¹, a ranking score, not a covariance
+
+
+# The library's own default, which UltraGPS-Control's get_position_full call uses
+CONTROL_MAX_SUBSETS = inspect.signature(UltraGPSPositionLib.get_position_full).parameters["max_subsets"].default
 
 
 @dataclass
 class Settings:
     filter_mode: str      = "library"   # receivers the simulator algorithms use: "library" or "bounds"
+    cep_subsets: str      = "control"   # library CEP search: "control" (first 15, as UltraGPS-Control) or "all"
     robust_scale_cm: float = 5.0        # soft-L1 knee
     ransac_tol_cm: float  = 8.0         # a receiver agrees with a fit within this
     ekf_accel: float      = 150.0       # process noise: random acceleration, cm/s²
@@ -98,20 +110,38 @@ class Solution:
 
 # ─── Building blocks (stateless) ─────────────────────────────────────────────
 
+def cep_max_subsets(settings: Settings, n_receivers: int) -> int:
+    """``max_subsets`` for the library's CEP search under ``settings.cep_subsets``."""
+    return 2 ** n_receivers if settings.cep_subsets == "all" else CONTROL_MAX_SUBSETS
+
+
 def ranges_from(coords: np.ndarray, pos) -> np.ndarray:
     return np.linalg.norm(coords - np.asarray(pos, dtype=float), axis=1)
 
 
-def covariance(coords: np.ndarray, pos, residuals: np.ndarray, floor_cm: float = 1.0) -> np.ndarray | None:
-    """s²(JᵀJ)⁻¹ of a range fit at ``pos`` (s² from the residuals, at least ``floor_cm``²)."""
-    m = len(residuals)
-    if m < 3 or pos is None:
+def noise_var(residuals: np.ndarray | None, unknowns: int = 2, floor_cm: float = 1.0) -> float | None:
+    """s² of a fit with ``unknowns`` parameters, at least ``floor_cm``²
+    (None without more residuals than unknowns)."""
+    if residuals is None or len(residuals) <= unknowns:
+        return None
+    return max(float(np.sum(np.square(residuals))) / (len(residuals) - unknowns), floor_cm ** 2)
+
+
+def covariance(coords: np.ndarray, pos, residuals: np.ndarray | None, floor_cm: float = 1.0,
+               offset: bool = False, s2: float | None = None) -> np.ndarray | None:
+    """x, y block of s²(JᵀJ)⁻¹ of a range fit at ``pos``, with s² from the
+    residuals unless given.  ``offset``: the fit also solved for a range
+    offset shared by every receiver, a third unknown."""
+    if s2 is None:
+        s2 = noise_var(residuals, 3 if offset else 2, floor_cm)
+    if pos is None or s2 is None:
         return None
     diff = np.asarray(pos, dtype=float) - coords
     J    = diff / np.maximum(np.linalg.norm(diff, axis=1), 1e-9)[:, None]
-    s2   = max(float(np.sum(residuals ** 2)) / (m - 2), floor_cm ** 2)
+    if offset:
+        J = np.c_[J, np.ones(len(J))]
     try:
-        return s2 * np.linalg.inv(J.T @ J)
+        return s2 * np.linalg.inv(J.T @ J)[:2, :2]
     except np.linalg.LinAlgError:
         return None
 
@@ -202,7 +232,7 @@ def solve_bias(lib, d, idx) -> Estimate:
         # Ranges that disagree badly (an echo, a blocked path) can be "explained"
         # by a huge common offset and a position far away: not a fix.
         return Estimate(None, False, idx, note=f"offset {r.x[2]:+.0f} cm: not plausible")
-    cov    = covariance(coords, r.x[:2], r.fun) if len(idx) > 4 else None
+    cov    = covariance(coords, r.x[:2], r.fun, offset=True) if len(idx) > 4 else None
     return Estimate(r.x[:2], bool(r.success), idx, cov, f"offset {r.x[2]:+.1f} cm")
 
 
@@ -290,11 +320,13 @@ class Solvers:
         self.lib      = UltraGPSPositionLib(config_path, max_differential=max_differential,
                                             max_distance=max_distance)
         self.settings = settings or Settings()
-        n = self.lib.receiver_count
-        # Subsets of size 3..n of n receivers, plus one: every subset is tried
-        self.max_subsets = 2 ** n - sum(comb(n, k) for k in range(3)) + 1
-        self.tracker     = Tracker(self.lib._receiver_coords, self.settings)
-        self.held: dict  = {}     # last good fix of each simulator algorithm
+        self.tracker  = Tracker(self.lib._receiver_coords, self.settings)
+        self.held: dict = {}      # last good fix of each simulator algorithm
+
+    @property
+    def max_subsets(self) -> int:
+        """The library CEP's ``max_subsets`` under the current settings."""
+        return cep_max_subsets(self.settings, self.lib.receiver_count)
 
     @property
     def coords(self) -> np.ndarray:
@@ -334,17 +366,13 @@ class Solvers:
                                   ranges_from(self.coords[sane], ols) - d[sane]))
         else:
             est["OLS"] = Estimate(None, False, note="needs 3 receivers")
-        lm = r["lm_position"]
-        lm_cov = (covariance(self.coords[sane], lm, ranges_from(self.coords[sane], lm) - d[sane])
-                  if lm is not None and len(sane) >= 3 else None)
-        est["LM"] = Estimate(lm, bool(r["lm_success"]), sane if r["lm_success"] else [], lm_cov,
-                             f"rms {r['lm_rms']:.1f} cm" if r["lm_rms"] is not None else "holding last fix")
-        cep_ok = bool(r["cep_success"])
-        est["CEP"] = Estimate(r["cep_position"], cep_ok,
-                              list(r["best_indices"] or []) if cep_ok else [],
-                              r["cov"] if cep_ok else None,
-                              f"CEP {r['cep']:.1f} cm" if cep_ok else
-                              ("outside the box: holding last fix" if len(sane) >= 3 else "holding last fix"))
+        lm     = r["lm_position"]
+        lm_res = ranges_from(self.coords[sane], lm) - d[sane] if lm is not None and len(sane) >= 3 else None
+        est["LM"] = Estimate(lm, bool(r["lm_success"]), sane if r["lm_success"] else [],
+                             covariance(self.coords[sane], lm, lm_res),
+                             f"rms {r['lm_rms']:.1f} cm" if r["lm_rms"] is not None else
+                             ("holding last fix" if lm is not None else "needs 3 receivers"))
+        est["CEP"] = self._cep(r, lm_res)
 
         if want("CEP4"):
             est["CEP4"] = solve_cep4(lib, d, idx)
@@ -366,3 +394,21 @@ class Solvers:
             elif e.pos is None and k in self.held:
                 est[k] = Estimate(self.held[k], False, [], None, e.note + ": holding last fix")
         return Solution(list(d), sane, inb, est)
+
+    def _cep(self, r: dict, lm_res: np.ndarray | None) -> Estimate:
+        """The library's CEP fix.  Its ellipse: the winning subset's geometry,
+        with the noise level s² from LM's residuals over every kept receiver (a
+        3-receiver subset fits almost exactly, so its own residuals say nothing).
+        When the CEP dropped a bad reading, LM's residuals still hold it, so the
+        ellipse grows: the readings disagree and a 3-receiver pick can be wrong."""
+        if r["cep_success"]:
+            best = list(r["best_indices"] or [])
+            cov  = covariance(self.coords[best], r["cep_position"], None, s2=noise_var(lm_res))
+            return Estimate(r["cep_position"], True, best, cov, f"CEP {r['cep']:.1f} cm", r["cov"])
+        if len(r["sane_indices"]) < 3:
+            note = "holding last fix" if r["cep_position"] is not None else "needs 3 receivers"
+        elif self.lib._cep_last_good_pos is None:
+            note = "outside the box: rejected (no earlier fix to hold)"
+        else:
+            note = "outside the box: holding last fix"
+        return Estimate(r["cep_position"], False, [], None, note)

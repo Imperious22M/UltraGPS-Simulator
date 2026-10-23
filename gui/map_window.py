@@ -7,7 +7,9 @@ ranges are, and how accurate each algorithm is (``engine.maps``).
 A map is computed on its own thread from a copy of the simulation, so the
 simulation keeps running; it is drawn as coloured cells with a few contour
 lines under the walls, obstacles and receivers.  Hovering shows the value
-under the cursor.  "Show on arena" shades the main arena with it.
+under the cursor.  "Show on arena" shades the main arena with it, with the
+same contour levels.  While a new map is computed, or after one failed or
+was cancelled, the previous map stays dimmed under a note saying so.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from PyQt6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QMainWindow, QProgr
                              QSpinBox, QVBoxLayout, QWidget)
 
 from engine import lab, maps
-from engine.solvers import ALGORITHMS
+from engine.solvers import ALGORITHMS, CONTROL_MAX_SUBSETS
 from gui import draw, theme
 from gui.arena import viridis
 from gui.charts import nice_step
@@ -80,7 +82,10 @@ KINDS = {k.key: k for k in (
             "the current physics, faults, receiver states and calibration. Each ping is solved on "
             "every receiver within the library's bounds, with no jump filter and no history. Cells "
             "where fewer than half the pings gave a fix are marked no fix. Compute it for each "
-            "algorithm to see where each one copes and where it breaks down."),
+            "algorithm to see where each one copes and where it breaks down. The library's CEP "
+            "rejects any fix outside the receivers' box (its _validate_position), so for CEP the "
+            "margin round the box shows as no fix; the header gives the no-fix share inside the "
+            "box separately."),
 )}
 
 FUNCTIONS = {"coverage": maps.coverage, "nlos": maps.first_arrival, "hdop": maps.hdop, "bias": maps.bias}
@@ -163,7 +168,18 @@ class MapData:
             text = f"median {np.median(fin):.2f}, worst {fin.max():.2f}"
         else:
             text = f"median {np.median(fin):.1f} cm, 95th percentile {np.percentile(fin, 95):.1f} cm"
-        return text + (f", no fix on {share(np.isinf(Z))}" if fin.size < Z.size else "")
+        if fin.size == Z.size:
+            return text
+        text += f", no fix on {share(np.isinf(Z))}"
+        if self.kind.key == "accuracy" and self.scene is not None:
+            # The library's CEP refuses fixes outside the receivers' box: say how it does inside it
+            (x0, y0), (x1, y1) = np.min(self.scene.believed, axis=0), np.max(self.scene.believed, axis=0)
+            X, Y = np.meshgrid(self.xs, self.ys)
+            box  = ~np.isnan(self.Z) & (X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1)
+            if box.any():
+                text += (f" ({100.0 * np.count_nonzero(np.isinf(self.Z) & box) / np.count_nonzero(box):.0f} % "
+                         f"inside the receivers' box)")
+        return text
 
 
 def make_map(kind: MapKind, xs, ys, Z, n_receivers: int, title: str, detail: str, seconds: float,
@@ -235,6 +251,7 @@ class MapCanvas(QWidget):
         """Show ``data`` (None: no map, just the scene and the message)."""
         self.data = data
         if data is not None:
+            self.message = ""
             pixels = viridis(data.Z[::-1], data.vmin, data.vmax)
             h, w   = pixels.shape
             self._image = QImage(np.ascontiguousarray(pixels).tobytes(), w, h, 4 * w,
@@ -243,7 +260,8 @@ class MapCanvas(QWidget):
         self.update()
 
     def set_message(self, text: str) -> None:
-        """What to say in the middle of the canvas while there is no map."""
+        """What to say in the middle of the canvas: alone while there is no
+        map, else over the map, dimmed, until the next map replaces it."""
         self.message = text
         self.update()
 
@@ -288,15 +306,30 @@ class MapCanvas(QWidget):
         v.cy += self.HEADER_H / 2 / v.scale
         draw.grid(p, v)
         if self.data is not None:
+            p.save()
+            if self.message:              # computing a new map, or the last one failed: this one is old
+                p.setOpacity(0.4)
             self._draw_cells(p)
+            p.restore()
         self._draw_scene(p)
-        self._draw_header(p)
-        if self.data is not None:
-            self._draw_colour_bar(p)
-            self._draw_hover(p)
-        else:
+        if self.data is None:
             draw.label(p, QPointF(v.width / 2, self.height() / 2), self.message, pal.text_dim, 10,
                        "center")
+            return
+        if self.message:
+            self._draw_notice(p)
+        else:
+            self._draw_header(p)
+        self._draw_colour_bar(p)
+        self._draw_hover(p)
+
+    def _draw_notice(self, p: QPainter) -> None:
+        """In place of the header while the map shown is old: the message, and which map it is."""
+        pal, d = theme.current, self.data
+        p.fillRect(QRectF(0, 0, self.view.width, self.HEADER_H + 4), color(pal.bg, 0.9))
+        draw.label(p, QPointF(12, 14), self.message, pal.accent, 9.0, bold=True)
+        draw.label(p, QPointF(12, 30), f"dimmed below: the previous map, {d.title}", pal.text_dim, 8.0)
+        draw.label(p, QPointF(12, 44), d.summary(), pal.text_muted, 7.5)
 
     def _draw_cells(self, p: QPainter) -> None:
         """The coloured cells, the no-fix cells crossed out, and the contour lines."""
@@ -304,7 +337,7 @@ class MapCanvas(QWidget):
         x0, y0, x1, y1 = d.cell_rect
         target = QRectF(v.px(x0, y1), v.px(x1, y0))
         p.save()
-        p.setOpacity(0.78 if pal.glow else 0.85)
+        p.setOpacity(p.opacity() * (0.78 if pal.glow else 0.85))
         p.drawImage(target, self._image)
         p.restore()
         # No fix: cells in the "lost" colour, crossed out
@@ -465,7 +498,7 @@ class MapCanvas(QWidget):
 class MapWindow(QMainWindow):
     """Choose a map, compute it in the background, look at it, put it on the arena."""
 
-    showOnArena = pyqtSignal(object)      # (xs, ys, Z, title, vmin, vmax), or None to clear
+    showOnArena = pyqtSignal(object)      # (xs, ys, Z, title, vmin, vmax, levels), or None to clear
 
     def __init__(self, sim, lock=None, parent=None):
         super().__init__(parent)
@@ -508,7 +541,7 @@ class MapWindow(QMainWindow):
         self.progress.setTextVisible(True)
         self.progress.setToolTip("Progress of the computation")
         self.show_btn = QPushButton("Show on arena")
-        self.show_btn.setToolTip("Shade the main window's arena with this map")
+        self.show_btn.setToolTip("Shade the main window's arena with this map, with the same contour lines")
         self.show_btn.setEnabled(False)
         self.clear_btn = QPushButton("Clear arena")
         self.clear_btn.setToolTip("Remove the map shading from the arena")
@@ -594,6 +627,9 @@ class MapWindow(QMainWindow):
             title  = f"{alg} {k.title}"
             short  = f"{alg} {k.short}"
             detail = f"{alg}, {n} pings per point, {step:g} cm grid"
+            if alg == "CEP":                # how far the library's subset search goes (Solver settings)
+                detail += (", every subset" if getattr(sc.settings, "cep_subsets", "control") == "all" else
+                           f", first {CONTROL_MAX_SUBSETS} subsets as UltraGPS-Control")
         else:
             fn     = partial(FUNCTIONS[k.key], sc, step)
             title  = k.title
@@ -623,7 +659,7 @@ class MapWindow(QMainWindow):
         """Send the map shown to the main window's arena."""
         d = self.canvas.data
         if d is not None:
-            self.showOnArena.emit((d.xs, d.ys, d.Z, d.short, d.vmin, d.vmax))
+            self.showOnArena.emit((d.xs, d.ys, d.Z, d.short, d.vmin, d.vmax, list(d.levels)))
 
     def wait(self, ms: int = 60000) -> bool:
         """Block until the computation in progress (if any) ends, for scripts

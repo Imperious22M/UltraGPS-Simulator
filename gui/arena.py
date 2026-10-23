@@ -21,8 +21,9 @@ The mouse edits the scene according to ``mode``:
   calpick   click: pick a calibration point (``calPointPicked``)
 
 In every mode middle/right-drag pans, the wheel zooms, double-click fits the
-room and Esc returns to ``move``.  Edits change the simulation under the
-runner's lock by assigning new objects, so a step never sees half a change.
+room and Esc returns to ``move``.  Edits change the simulation by assigning
+new objects between two steps, so a step never sees half a change: through
+``post`` (the runner's, which never waits for a step) or else under ``lock``.
 """
 
 from __future__ import annotations
@@ -220,10 +221,11 @@ class ArenaView(QWidget):
 
     wave_seconds = WAVE_SECONDS
 
-    def __init__(self, sim, lock=None, parent=None):
+    def __init__(self, sim, lock=None, parent=None, post=None):
         super().__init__(parent)
         self.sim         = sim
         self.lock        = lock if lock is not None else contextlib.nullcontext()
+        self.post        = post              # post(fn): run fn between two steps, without waiting
         self.view        = draw.View()
         self.frame       = sim.last
         self.shown       = set(ALGORITHMS)
@@ -300,6 +302,10 @@ class ArenaView(QWidget):
         self.hud_text = text
         self._changed()
 
+    def refresh(self) -> None:
+        """Redraw from the simulation: something changed it outside a frame."""
+        self._changed()
+
     def set_cal_points(self, points, pending: bool = False) -> None:
         """Calibration points to mark P1..Pn; ``pending`` while still being chosen."""
         self.cal_points  = [(float(x), float(y)) for x, y in points]
@@ -307,8 +313,9 @@ class ArenaView(QWidget):
         self._changed()
 
     def set_heatmap(self, xs, ys, Z, title: str = "", vmin: float | None = None,
-                    vmax: float | None = None) -> None:
-        """Shade the arena with ``Z[j, i]`` at ``(xs[i], ys[j])`` (both ascending)."""
+                    vmax: float | None = None, levels=None) -> None:
+        """Shade the arena with ``Z[j, i]`` at ``(xs[i], ys[j])`` (both ascending),
+        with contour lines at ``levels`` (default: four evenly spaced)."""
         xs, ys, Z = np.asarray(xs, dtype=float), np.asarray(ys, dtype=float), np.asarray(Z, dtype=float)
         finite    = Z[np.isfinite(Z)]
         if vmin is None:
@@ -319,7 +326,8 @@ class ArenaView(QWidget):
         Z         = np.where(np.isposinf(Z), vmax, Z)     # no fix at all: the worst colour, not a hole
         hx        = (xs[-1] - xs[0]) / max(len(xs) - 1, 1) / 2
         hy        = (ys[-1] - ys[0]) / max(len(ys) - 1, 1) / 2
-        levels    = np.linspace(vmin, vmax, 6)[1:-1]
+        levels    = (np.linspace(vmin, vmax, 6)[1:-1] if levels is None else
+                     np.array([v for v in levels if vmin <= v <= vmax], dtype=float))
         lines     = QPainterPath()
         for level in levels:
             for (ax, ay), (bx, by) in contour(xs, ys, Z, level):
@@ -356,8 +364,9 @@ class ArenaView(QWidget):
             finally:
                 p.end()
 
-    def export_svg(self, path: str) -> None:
-        """Save the arena as it is drawn now (without the ping animation) as SVG."""
+    def export_svg(self, path: str) -> bool:
+        """Save the arena as it is drawn now (without the ping animation) as
+        SVG; False if the file could not be written."""
         w, h = self.width(), self.height()
         gen  = QSvgGenerator(QSvgGenerator.SvgVersion.Svg11)    # SVG Tiny drops the hatching's clip
         gen.setFileName(path)
@@ -366,11 +375,14 @@ class ArenaView(QWidget):
         gen.setResolution(self.logicalDpiX())                   # text the size it is on screen
         gen.setTitle("UltraGPS arena")
         with self._view_for(w, h):
-            p = QPainter(gen)
+            p = QPainter()
+            if not p.begin(gen):
+                return False
             try:
                 self.render_scene(p, w, h, live=False)
             finally:
                 p.end()
+        return True
 
     @contextlib.contextmanager
     def _view_for(self, w: int, h: int):
@@ -508,7 +520,8 @@ class ArenaView(QWidget):
                 tuple(self.layers[k] for k in ("grid", "heatmap", "walls", "beams", "labels")),
                 tuple(map(tuple, world.walls)),
                 tuple((tuple(map(tuple, o.points)), o.name) for o in world.obstacles),
-                tuple((tuple(r.position), r.facing_deg, r.state) for r in self.sim.receivers),
+                tuple((tuple(r.position), r.facing_deg + self._aim(i), r.state)
+                      for i, r in enumerate(self.sim.receivers)),
                 (env.beam_patterns, env.rx_beam_deg, env.fov_cutoff, env.fov_half_deg))
 
     def _stamp(self, p: QPainter, at: QPointF, radius: int, look, paint) -> None:
@@ -573,19 +586,27 @@ class ArenaView(QWidget):
         v = self.view
         return QTransform(v.scale, 0, 0, -v.scale, v.width / 2 - v.cx * v.scale, v.height / 2 + v.cy * v.scale)
 
+    def _aim(self, i: int) -> float:
+        """How far receiver ``i``'s beam axis really points off its facing (its
+        module's mounting error; 0 for hardware without a per-module spread)."""
+        module = getattr(self.sim.hardware, "module", None)
+        return float(module(i)[1]) if module is not None else 0.0
+
     def _draw_receiver_beams(self, p: QPainter) -> None:
-        """Receiver beam lobes and the dashed field-of-view limits out to the walls."""
+        """Receiver beam lobes and the dashed field-of-view limits out to the
+        walls, along each receiver's real beam axis."""
         pal, v, env = theme.current, self.view, self.sim.env
         walls = self.sim.world.walls
         A, B  = _segments([walls] if len(walls) >= 3 else [])
-        for r in self.sim.receivers:
+        for i, r in enumerate(self.sim.receivers):
             if r.state == "off":
                 continue
+            axis = r.facing_deg + self._aim(i)
             if env.beam_patterns:
-                draw.beam_lobe(p, v, r.position, r.facing_deg, env.rx_beam_deg, BEAM_CM, pal.receiver, 0.2)
+                draw.beam_lobe(p, v, r.position, axis, env.rx_beam_deg, BEAM_CM, pal.receiver, 0.2)
             if env.fov_cutoff:
                 for side in (-1, 1):
-                    end = _ray_end(r.position, r.facing_deg + side * env.fov_half_deg, A, B)
+                    end = _ray_end(r.position, axis + side * env.fov_half_deg, A, B)
                     draw.polyline(p, v, [r.position, end], pal.status["angle"], 1.0, 0.5, draw.DASH, glow=False)
 
     def _draw_tx_beam(self, p: QPainter, frame) -> None:
@@ -662,10 +683,11 @@ class ArenaView(QWidget):
         """Every path that reached one receiver, labelled with its strength over
         the detection threshold: dashed if it could be detected, dotted if too weak."""
         v = self.view
+        det = rd.detected
         for a in sorted(rd.arrivals, key=lambda a: -a.ratio_db)[:MAX_HOVER_ARRIVALS]:
             c   = _key_colour(_path_key(a))
             pts = np.asarray(a.path.points, dtype=float)
-            if a is not rd.detected:
+            if det is None or a.path is not det.path or a.source != det.source:     # drawn solid already
                 draw.polyline(p, v, pts, c, 1.0, 0.75, draw.DASH if a.cycle is not None else draw.DOT, glow=False)
             at = pts[-2] if len(pts) > 2 else pts.mean(axis=0)
             draw.label(p, v.px(*at) + QPointF(0, -10), f"{a.ratio_db:+.0f} dB", c, 7.5, "center")
@@ -992,10 +1014,14 @@ class ArenaView(QWidget):
         """What receiver ``i`` heard this frame and what the library made of it."""
         r, frame = self.sim.receivers[i], self.frame
         lines    = [f"R{r.id}   state: {r.state}   facing {r.facing_deg:.0f}°"]
-        if frame is not None and i < len(frame.ticks):
-            d  = frame.solution.distances[i]
-            st = frame.status[i]
-            lines += [f"{st}: {STATUS.get(st, 'replayed from a tick log')}",
+        aim      = self._aim(i)
+        if abs(aim) >= 0.5:
+            lines.append(f"beam axis     {r.facing_deg + aim:.0f}° (mounted {aim:+.1f}° off)")
+        if frame is not None and i < len(frame.ticks) and i < len(frame.solution.distances):
+            d    = frame.solution.distances[i]
+            st   = frame.status[i]
+            what = STATUS.get(st, "replayed from a tick log" if st == "log" else "no description")
+            lines += [f"{st}: {what}",
                       f"tick          {frame.ticks[i]}",
                       f"distance      {d:.1f} cm (library, from the tick)"]
             rd = frame.readings[i] if i < len(frame.readings) else None
@@ -1008,6 +1034,8 @@ class ArenaView(QWidget):
                 lines += [f"strength      {a.ratio_db:+.1f} dB over threshold",
                           f"path          {a.path.kind}, {a.path.length:.1f} cm"
                           + ("" if a.source == "TX" else f", from {a.source}'s own burst")]
+            elif rd is not None and rd.status == "noise" and rd.echo_ms is not None:
+                lines.append(f"noise         tripped the comparator at {rd.echo_ms:.2f} ms, before any sound")
             elif rd is not None and rd.arrivals:
                 best = max(rd.arrivals, key=lambda x: x.ratio_db)
                 lines.append(f"strongest     {best.ratio_db:+.1f} dB ({best.path.kind}): too weak or unheard")
@@ -1105,8 +1133,8 @@ class ArenaView(QWidget):
             self._band = (self._band[0], (wx, wy))
         elif self._drag is not None:
             i, offset = self._drag
-            with self.lock:
-                self.sim.receivers[i].position = np.array([wx, wy]) + offset
+            r, at     = self.sim.receivers[i], np.array([wx, wy]) + offset
+            self._edit(lambda: setattr(r, "position", at))
         self._changed()
 
     def mouseReleaseEvent(self, e) -> None:
@@ -1149,8 +1177,7 @@ class ArenaView(QWidget):
         i   = self.receiver_at(pos.x(), pos.y()) if self.mode == "receiver" else None
         if i is not None:
             r = self.sim.receivers[i]
-            with self.lock:
-                r.facing_deg = (r.facing_deg + 5.0 * steps + 180.0) % 360.0 - 180.0
+            self._edit(lambda: setattr(r, "facing_deg", (r.facing_deg + 5.0 * steps + 180.0) % 360.0 - 180.0))
             self.receiversEdited.emit()
         else:
             self._auto_fit = False
@@ -1186,6 +1213,14 @@ class ArenaView(QWidget):
 
     # ─── Editing the simulation ──────────────────────────────────────────────
 
+    def _edit(self, fn) -> None:
+        """Change the simulation with ``fn()`` between two steps."""
+        if self.post is not None:
+            self.post(fn)
+        else:
+            with self.lock:
+                fn()
+
     def _add_obstacle(self, a, b) -> None:
         (x0, y0), (x1, y1) = a, b
         if abs(x1 - x0) < 2.0 or abs(y1 - y0) < 2.0:
@@ -1193,14 +1228,12 @@ class ArenaView(QWidget):
         world = self.sim.world
         box   = Obstacle.rect(float(round(x0)), float(round(y0)), float(round(x1)), float(round(y1)),
                               name=f"box {len(world.obstacles) + 1}")
-        with self.lock:
-            world.obstacles = [*world.obstacles, box]
+        self._edit(lambda: setattr(world, "obstacles", [*world.obstacles, box]))
         self.worldEdited.emit()
 
     def _delete_obstacle(self, k: int) -> None:
-        world = self.sim.world
-        with self.lock:
-            world.obstacles = [o for j, o in enumerate(world.obstacles) if j != k]
+        world, gone = self.sim.world, self.sim.world.obstacles[k]
+        self._edit(lambda: setattr(world, "obstacles", [o for o in world.obstacles if o is not gone]))
         self._hover_obstacle = None
         self.worldEdited.emit()
 

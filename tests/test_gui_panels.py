@@ -25,9 +25,10 @@ from engine.simulation import Simulation
 from engine.world import Obstacle
 from gui import theme
 from gui.charts import EchoScope, ErrorChart, nice_step
-from gui.panels import (ENV_GROUPS, AlgorithmPanel, EnvironmentPanel, FaultsPanel, ReceiverPanel,
-                        ScenarioPanel)
+from gui.panels import (ENV_GROUPS, SOLVER_FIELDS, AlgorithmPanel, EnvironmentPanel, FaultsPanel,
+                        ReceiverPanel, ScenarioPanel)
 from gui.runner import SimRunner
+from tests.helpers import ideal_sim
 
 app = None
 
@@ -99,6 +100,51 @@ class ChartTest(unittest.TestCase):
         painted(chart)
         chart.set_data(sim, set())
         painted(chart)
+
+    def test_end_labels_stay_clear_of_the_lin_log_switch(self):
+        sim, _, _ = make_sim(0)
+        n = 30
+        sim.times = type(sim.times)([0.1 * k for k in range(1, n + 1)], maxlen=300)
+        for k in theme.ALGO_ORDER:                       # every line ends at the bottom ...
+            sim.errors[k] = type(sim.errors[k])([0.5] * n, maxlen=300)
+        sim.errors["CEP"] = type(sim.errors["CEP"])([0.5] * (n - 1) + [500.0], maxlen=300)   # ... but one
+        chart = ErrorChart()
+        chart.set_data(sim, set(theme.ALGO_ORDER))
+        for h in (200, 140):
+            painted(chart, 600, h)
+            plot = chart._plot_rect()
+            t, series, t0, span = chart._visible()
+            lo, hi, _ = chart._y_range(np.concatenate(list(series.values())))
+            labels = chart._end_labels(plot, series, lambda v: plot.bottom() - (v - lo) / (hi - lo) * plot.height())
+            ys = sorted(e[1] for e in labels)
+            self.assertGreaterEqual(ys[0], plot.top() + 4 - 1e-9, h)      # below the switch's row
+            self.assertLessEqual(ys[-1], plot.bottom() + 4 + 1e-9, h)
+            self.assertGreaterEqual(min(np.diff(ys)), ErrorChart.MIN_LABEL_GAP - 1e-9, h)
+            self.assertIn("CEP ↑", [e[2] for e in labels])
+
+    def test_scope_draws_noise_interference_and_unknown_statuses(self):
+        sim, _, frame = make_sim(1, noise_rate_hz=400.0)
+        noisy = [r for r in frame.readings if r.status == "noise"]
+        self.assertTrue(noisy)
+        self.assertTrue(all(r.detected is None and r.echo_ms is not None for r in noisy))
+        scope = EchoScope()
+        scope.set_frame(frame, sim.env)
+        painted(scope, 900, 300)
+        self.assertTrue(any("ambient ultrasonic noise" in tip for _, tip in scope.hits))
+        sim, _, frame = make_sim(1)
+        i, r = next((i, r) for i, r in enumerate(frame.readings) if r.detected is not None)
+        copy = dataclasses.replace(r.detected, cycle=(r.detected.cycle or 0) + 2)   # as interference reports it
+        late = r.echo_ms + 2 * 0.025
+        readings = list(frame.readings)
+        readings[i] = dataclasses.replace(r, status="fade", detected=copy, echo_ms=late)
+        readings[(i + 1) % len(readings)] = dataclasses.replace(readings[(i + 1) % len(readings)],
+                                                                status="no such status")
+        scope.set_frame(dataclasses.replace(frame, readings=readings), sim.env)
+        painted(scope, 900, 300)
+        self.assertTrue(any("interference" in tip for _, tip in scope.hits))
+        panel = ReceiverPanel(sim, SimRunner(sim))
+        panel.refresh(dataclasses.replace(frame, readings=readings))
+        self.assertTrue(panel.table.item(2 * i, 0).text().startswith(f"R{i}  fade"))
 
     def test_scope_shows_why_r1_reads_long(self):
         sim, _, frame = make_sim()
@@ -213,6 +259,44 @@ class PanelTest(unittest.TestCase):
         panel.filter.editors["max_differential"].spin.setValue(20.0)
         self.assertEqual((sim.solvers.lib.max_distance, sim.solvers.lib.max_differential), (300.0, 20.0))
 
+    def test_receiver_panel_shows_a_replayed_row_of_the_wrong_length(self):
+        sim, runner, frame = make_sim()
+        panel = ReceiverPanel(sim, runner)
+        for ticks, r5 in (([1500, 1400, 1300], "0"), (list(range(1, 9)), "6")):
+            sim.last = dataclasses.replace(frame, ticks=ticks, readings=[], true=None)
+            panel.refresh(sim.last)
+            self.assertEqual(panel.table.item(2 * 5 + 1, 3).text(), r5)    # R5: "0" when the row is short
+            panel._restyle()                                               # a palette change redraws it
+
+    def test_panels_report_edits_and_post_them_without_waiting(self):
+        sim, runner, frame = make_sim(1)
+        receivers, scenario = ReceiverPanel(sim, runner), ScenarioPanel(sim, runner)
+        seen = []
+        for panel in (receivers, scenario):
+            panel.edited.connect(lambda p=panel: seen.append(type(p).__name__))
+        held, done = threading.Event(), threading.Event()
+        def long_step():
+            with runner.lock:
+                held.set()
+                done.wait(5)
+        worker = threading.Thread(target=long_step)
+        worker.start()
+        try:
+            held.wait(5)
+            start = time.perf_counter()
+            receivers.survey.editors["sigma"].spin.setValue(4.0)
+            mode = scenario.form.editors["mode"]
+            mode.setCurrentIndex(mode.findData("lawnmower"))
+            self.assertLess(time.perf_counter() - start, 0.5)       # the GUI did not wait for the step
+            np.testing.assert_allclose(sim.coords, sim.believed)      # not applied mid-step
+        finally:
+            done.set()
+            worker.join()
+        runner.call(lambda: None)                                     # the runner's next step applies them
+        self.assertGreater(np.abs(sim.coords - sim.believed).max(), 0.0)
+        self.assertEqual(sim.motion.mode, "lawnmower")
+        self.assertEqual(seen, ["ReceiverPanel", "ScenarioPanel"])
+
     def test_receiver_panel_switches_states_and_shows_readings(self):
         sim, runner, frame = make_sim()
         panel = ReceiverPanel(sim, runner)
@@ -242,8 +326,25 @@ class PanelTest(unittest.TestCase):
         self.assertEqual(sim.solvers.settings.robust_scale_cm, 9.0)
         panel.settings.editors["filter_mode"].setCurrentIndex(1)
         self.assertEqual(sim.solvers.settings.filter_mode, "bounds")
+        subsets = panel.settings.editors["cep_subsets"]
+        self.assertEqual(subsets.currentData(), "control")            # as UltraGPS-Control calls it
+        subsets.setCurrentIndex(subsets.findData("all"))
+        self.assertEqual(sim.solvers.settings.cep_subsets, "all")
         next(b for b in panel.findChildren(QAbstractButton) if b.text() == "Reset stats").click()
         self.assertEqual((sim.frames, len(sim.times)), (0, 0))
+
+    def test_cep_subsets_tip_says_which_subsets_the_library_tries(self):
+        sim = ideal_sim(noise=1.0)
+        sizes, real = [], sim.solvers.lib._compute_cep
+        sim.solvers.lib._compute_cep = lambda d, idx: sizes.append(len(idx)) or real(d, idx)
+        sim.place((30, 50))
+        sim.step()
+        tip = next(f.tip for f in SOLVER_FIELDS if f.attr == "cep_subsets")
+        self.assertEqual(sorted(set(sizes)), [3, 6])                  # all six, then triples only
+        self.assertIn(f"all six plus {sizes.count(3)} of the 20 triples", tip)
+        self.assertIn("no 4- or 5-receiver subset", tip)
+        self.assertIn(f"{42 - len(sizes)} of the 42", tip)
+        self.assertNotIn("smaller subsets", tip)
 
     def test_scenario_panel(self):
         sim, runner, frame = make_sim(1)

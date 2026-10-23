@@ -8,6 +8,7 @@ import numpy as np
 
 from tests.helpers import ideal_sim
 from engine import maps
+from engine import solvers as S
 from engine.hardware import Environment
 from engine.simulation import Simulation
 from engine.world import Obstacle
@@ -151,6 +152,15 @@ class AccuracyTest(unittest.TestCase):
         with self.assertRaises(maps.Cancelled):
             maps.accuracy(sim, "OLS", trials=1, step=50.0, cancel=lambda: calls.append(1) or len(calls) > 3)
 
+    def test_cancel_stops_within_a_point(self):
+        # A CEP point at 200 pings takes seconds: cancel must not wait for it
+        sim, seen, calls = ideal_sim(noise=1.0), [], []
+        with self.assertRaises(maps.Cancelled):
+            maps.accuracy(sim, "LM", trials=50, step=50.0, progress=seen.append,
+                          cancel=lambda: calls.append(1) or len(calls) > 3)
+        self.assertEqual(seen, [])                                        # not even the first point finished
+        self.assertEqual(len(calls), 4)
+
     def test_no_fix_without_enough_receivers(self):
         sim = ideal_sim()
         for i in range(4):
@@ -174,6 +184,18 @@ class AccuracyTest(unittest.TestCase):
             self.assertTrue(est.ok, alg)
             self.assertLess(np.hypot(*(est.pos - p)), 0.5, alg)
         self.assertFalse(maps.solve(lib, d, [0, 1], "LM").ok)
+
+    def test_library_cep_searches_as_the_settings_say(self):
+        sim, asked = ideal_sim(), []
+        lib    = sim.solvers.lib
+        search = lib._find_best_subset
+        lib._find_best_subset = lambda d, idx, n: asked.append(n) or search(d, idx, n)
+        d   = np.linalg.norm(lib._receiver_coords - [10.0, 20.0], axis=1)
+        est = maps.solve(lib, d, list(range(6)), "CEP")
+        maps.solve(lib, d, list(range(6)), "CEP", S.Settings(cep_subsets="all"))
+        self.assertEqual(asked, [S.CONTROL_MAX_SUBSETS, 2 ** 6])
+        self.assertIsNone(est.cov)                                        # the library's matrix is a score
+        self.assertIsNotNone(est.score_cov)
 
 
 if __name__ == "__main__":

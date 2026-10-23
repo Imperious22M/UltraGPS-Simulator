@@ -19,6 +19,18 @@ ALGO_SHAPES = {"OLS": "square", "LM": "circle", "CEP": "diamond", "CEP4": "trian
                "ROBUST": "triangle_down", "BIAS": "hexagon", "RANSAC": "star", "EKF": "ring"}
 
 
+class StatusColours(dict):
+    """``{receiver status: colour}``.  A status without a colour of its own
+    (the hardware model may gain new ones) gets ``fallback``, never a KeyError."""
+
+    def __init__(self, colours: dict, fallback: str):
+        super().__init__(colours)
+        self.fallback = fallback
+
+    def __missing__(self, key) -> str:
+        return self.fallback
+
+
 @dataclass(frozen=True)
 class Palette:
     name: str
@@ -40,22 +52,22 @@ class Palette:
     wave: str           # wavefront
     glow: bool          # draw lines with a soft glow
     algo: dict          # {algorithm: colour}
-    status: dict        # {receiver status: colour}
+    status: StatusColours   # {receiver status: colour}
 
 
-_STATUS_DARK = {
+_STATUS_DARK = StatusColours({
     "ok": "#5BE37D", "walk": "#9CCC65", "near": "#FFE066", "echo": "#FFB347", "bent": "#C792EA",
-    "crosstalk": "#FF6AD5", "lost": "#FF5C5C", "missed": "#FF5C5C", "radio": "#FF5C5C",
-    "angle": "#FF8C66", "range": "#FF8C66", "off": "#4A5563", "dropout": "#FF5C5C",
-    "timeout": "#FF5C5C", "spike": "#FF3B30", "log": "#9FB3C8",
-}
+    "crosstalk": "#FF6AD5", "fade": "#4FC9B0", "noise": "#C8B07A", "lost": "#FF5C5C",
+    "missed": "#FF5C5C", "radio": "#FF5C5C", "angle": "#FF8C66", "range": "#FF8C66", "off": "#4A5563",
+    "dropout": "#FF5C5C", "timeout": "#FF5C5C", "spike": "#FF3B30", "log": "#9FB3C8",
+}, fallback="#8FA1B3")
 
-_STATUS_LIGHT = {
+_STATUS_LIGHT = StatusColours({
     "ok": "#1E9E4A", "walk": "#5C8A1F", "near": "#B08900", "echo": "#D2691E", "bent": "#7B3FA0",
-    "crosstalk": "#C2188B", "lost": "#D32F2F", "missed": "#D32F2F", "radio": "#D32F2F",
-    "angle": "#E64A19", "range": "#E64A19", "off": "#9AA5B1", "dropout": "#D32F2F",
-    "timeout": "#D32F2F", "spike": "#B71C1C", "log": "#455A64",
-}
+    "crosstalk": "#C2188B", "fade": "#00897B", "noise": "#8A6D2B", "lost": "#D32F2F",
+    "missed": "#D32F2F", "radio": "#D32F2F", "angle": "#E64A19", "range": "#E64A19", "off": "#9AA5B1",
+    "dropout": "#D32F2F", "timeout": "#D32F2F", "spike": "#B71C1C", "log": "#455A64",
+}, fallback="#52606D")
 
 PALETTES = {
     "vector": Palette(
@@ -112,9 +124,8 @@ def stylesheet(p: Palette) -> str:
     return f"""
     QWidget {{ background: {p.panel}; color: {p.text}; }}
     QMainWindow::separator {{ background: {p.border}; width: 1px; height: 1px; }}
-    QDockWidget {{ color: {p.text_dim}; titlebar-close-icon: none; }}
-    QDockWidget::title {{ background: {p.panel}; padding: 5px 8px; border-bottom: 1px solid {p.border};
-                          text-transform: uppercase; }}
+    QDockWidget {{ color: {p.text_dim}; }}
+    QDockWidget::title {{ background: {p.panel}; padding: 5px 8px; border-bottom: 1px solid {p.border}; }}
     QToolBar {{ background: {p.panel}; border: none; border-bottom: 1px solid {p.border}; spacing: 2px; padding: 2px; }}
     QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 3px; padding: 4px 8px; color: {p.text}; }}
     QToolButton:hover {{ border-color: {p.border}; background: {p.panel_alt}; }}

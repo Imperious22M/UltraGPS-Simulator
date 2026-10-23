@@ -66,7 +66,7 @@ python3 app.py --screenshot shot.png --frames 60 --size 1600x1000   # render and
 Command-line tools (no window):
 
 ```bash
-python3 -m engine.benchmark --frames 300      # every algorithm under ten standard conditions
+python3 -m engine.benchmark --frames 400      # every algorithm under standard conditions (section 10)
 python3 -m engine.cal_points --apply          # best calibration points (see section 7)
 python3 -m unittest discover -s tests -t .    # the test suite
 ```
@@ -233,7 +233,7 @@ firmware does it (`UltraGPS-Arduino/base-station/src/main.cpp`):
 
 | Effect | Model | Control | What you see | Why it matters on the real system |
 |---|---|---|---|---|
-| Speed of sound | 331.3 + 0.606·T + 0.0124·RH m/s | Air temperature, humidity; calibration temperature | Every range scales by c_cal / c | 10 °C warmer than at calibration = 1.7 % long, 5 cm at 3 m |
+| Speed of sound | 331.3 + 0.606·T + 0.0124·RH m/s | Air temperature, humidity; calibration temperature | Every range scales by c_cal / c | 10 °C warmer than at calibration = 1.7 % short (5 cm at 3 m); 10 °C colder = 1.8 % long |
 | Absorption | ISO 9613-1 at 40 kHz (about 1.3 dB/m in a room) | Temperature, humidity | Far receivers get weaker, so detect later | Ultrasound fades 250 times faster than audible sound; humidity matters |
 | Spreading | 1/r amplitude | — | Strength falls 6 dB per doubling of distance | Sets the useful range |
 | Beam patterns | Circular piston, −6 dB at ±27.5° (400ST/SR160-type transducers), nulls filled in, −30 dB behind | Beam patterns on/off, receiver beam, transmitter mode (omni, heading, fixed) | Off-axis receivers detect later, then not at all; lobes drawn on the arena | Which receivers can hear which parts of the arena depends on how they are aimed |
@@ -576,9 +576,10 @@ about it.
    solver also takes out part of a temperature change, which looks like a
    common offset over a small arena.
 5. **Temperature matters more than noise.** 10 °C between calibration and use
-   makes every range 1.7 % long: 5 cm at 3 m. Measuring the air temperature
-   and scaling by c_cal / c costs nothing; so does calibrating in the
-   conditions you run in.
+   changes every range by about 1.7 %, 5 cm at 3 m: short when the air is
+   warmer than at calibration, long when it is colder. Measuring the air
+   temperature and scaling by c / c_cal costs nothing; so does calibrating in
+   the conditions you run in.
 6. **Range walk is a bias calibration cannot remove.** A weak signal is
    detected a cycle or more late (0.86 cm a cycle). It depends on distance
    and angle, so a straight-line calibration absorbs it only where it was

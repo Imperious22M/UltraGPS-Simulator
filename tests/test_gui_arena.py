@@ -1,16 +1,19 @@
 """Arena view: drawing in both palettes, layers, the ping animation, tooltips,
-export, and editing the scene with the mouse (always under the runner's lock)."""
+export, and editing the scene with the mouse (under the runner's lock, or
+handed to its ``post``)."""
 
 import dataclasses
 import os
 import tempfile
 import time
+import types
 import unittest
+from unittest import mock
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 try:
     from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
-    from PyQt6.QtGui import QImage, QMouseEvent, QWheelEvent
+    from PyQt6.QtGui import QImage, QMouseEvent, QPainter, QWheelEvent
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
 except ImportError as exc:
@@ -24,7 +27,7 @@ from engine.hardware import STATUS
 from engine.simulation import Simulation
 from engine.solvers import Estimate
 from engine.world import Obstacle
-from gui import theme
+from gui import draw, theme
 from gui.arena import COLOUR_BAR_PX, HUD_BOTTOM_PX, LAYERS, ArenaView
 
 app = QApplication.instance() or QApplication([])
@@ -43,6 +46,22 @@ class CountingLock:
 
     def __exit__(self, *exc):
         return False
+
+
+class Posted:
+    """Stands in for ``SimRunner.post``: keeps the changes until ``run()``,
+    as while a step is in progress."""
+
+    def __init__(self):
+        self.fns = []
+
+    def __call__(self, fn):
+        self.fns.append(fn)
+
+    def run(self):
+        fns, self.fns = self.fns, []
+        for fn in fns:
+            fn()
 
 
 def mouse(widget, kind, x, y, button=LEFT, buttons=None):
@@ -197,6 +216,18 @@ class ArenaDrawingTest(unittest.TestCase):
         self.assertIn("RMS residual", svg)
         self.arena.clear_heatmap()
         self.assertIsNone(self.arena._heatmap)
+
+    def test_heatmap_contours_at_the_levels_given(self):
+        xs, ys = np.linspace(0, 100, 11), np.linspace(0, 50, 6)
+        Z      = np.tile(xs, (len(ys), 1))
+        self.arena.set_heatmap(xs, ys, Z, "rising", 0.0, 100.0, levels=[-5.0, 25.0, 50.0, 150.0])
+        np.testing.assert_array_equal(self.arena._heatmap.levels, [25.0, 50.0])     # outside the range: left out
+        self.assertFalse(self.arena._heatmap.contours.isEmpty())
+        self.arena.set_heatmap(xs, ys, Z, "rising", 0.0, 100.0)
+        np.testing.assert_allclose(self.arena._heatmap.levels, [20.0, 40.0, 60.0, 80.0])
+        self.arena.set_heatmap(xs, ys, Z, "rising", 0.0, 100.0, levels=[])
+        self.assertTrue(self.arena._heatmap.contours.isEmpty())
+        self.arena.render_to(QImage(900, 600, QImage.Format.Format_RGB32))
 
     def test_render_to_works_before_the_widget_is_shown(self):
         hidden = ArenaView(self.sim)
@@ -407,6 +438,125 @@ class ArenaEditingTest(unittest.TestCase):
         self.arena.cursorMoved.connect(lambda x, y: moved.append((x, y)))
         mouse(self.arena, QEvent.Type.MouseMove, 123, 234, NONE, NONE)
         self.assertEqual(moved, [self.arena.view.world(123, 234)])
+
+
+class ArenaPhysicsTest(unittest.TestCase):
+    """What the arena shows of the hardware model: module aim, noise, statuses it does not know."""
+
+    def setUp(self):
+        theme.apply(app, "vector")
+        self.sim = Simulation(seed=2)
+        self.sim.env = self.sim.env.copy(beam_patterns=True, fov_cutoff=True, aim_spread_deg=12.0)
+        self.arena = ArenaView(self.sim)
+        self.arena.resize(900, 600)
+
+    def tearDown(self):
+        self.arena.deleteLater()
+
+    def test_beams_point_along_each_modules_real_axis(self):
+        img = QImage(900, 600, QImage.Format.Format_RGB32)
+        p   = QPainter(img)
+        try:
+            with mock.patch.object(draw, "beam_lobe") as lobe:
+                self.arena._draw_receiver_beams(p)
+        finally:
+            p.end()
+        hw   = self.sim.hardware
+        axes = [r.facing_deg + hw.module(i)[1] for i, r in enumerate(self.sim.receivers) if r.state != "off"]
+        np.testing.assert_allclose([c.args[3] for c in lobe.call_args_list], axes)
+        self.assertTrue(any(abs(hw.module(i)[1]) > 1.0 for i in range(len(self.sim.receivers))))
+        i   = max(range(len(self.sim.receivers)), key=lambda k: abs(hw.module(k)[1]))
+        q   = self.arena.view.px(*self.sim.receivers[i].position)
+        self.assertIn("beam axis", self.arena.tooltip_at(q.x(), q.y()))
+
+    def test_changing_the_aim_spread_redraws_the_beams(self):
+        before = self.arena._scenery_state(900, 600)
+        self.sim.env = self.sim.env.copy(aim_spread_deg=0.0)
+        self.assertNotEqual(self.arena._scenery_state(900, 600), before)
+        self.assertEqual(self.arena._aim(0), 0.0)
+        q = self.arena.view.px(*self.sim.receivers[0].position)
+        self.assertNotIn("beam axis", self.arena.tooltip_at(q.x(), q.y()))
+
+    def test_hardware_without_modules_aims_along_the_facing(self):
+        with mock.patch.object(self.sim, "hardware", types.SimpleNamespace()):
+            self.assertEqual(self.arena._aim(1), 0.0)
+
+    def test_noise_and_unknown_statuses_are_drawn_and_explained(self):
+        self.sim.env = self.sim.env.copy(noise_rate_hz=400.0)
+        self.sim.place((0, 0))
+        for _ in range(40):
+            frame = self.sim.step(0.1)
+            noisy = [i for i, r in enumerate(frame.readings) if r.status == "noise"]
+            if noisy:
+                break
+        self.assertTrue(noisy, "no reading tripped by noise")
+        self.arena.set_frame(frame)
+        self.arena.render_to(QImage(900, 600, QImage.Format.Format_RGB32))
+        q   = self.arena.view.px(*self.sim.receivers[noisy[0]].position)
+        tip = self.arena.tooltip_at(q.x(), q.y())
+        self.assertIn(STATUS["noise"], tip)
+        self.assertIn("tripped the comparator at", tip)
+        odd = dataclasses.replace(frame, readings=[dataclasses.replace(r, status="humming") for r in frame.readings])
+        self.arena.set_frame(odd)
+        self.arena.render_to(QImage(900, 600, QImage.Format.Format_RGB32))   # no KeyError for a new status
+        self.assertEqual(self.arena._status_colour(odd, 0), theme.current.text_dim)
+        self.assertIn("humming: no description", self.arena.tooltip_at(q.x(), q.y()))
+
+
+class ArenaPostTest(unittest.TestCase):
+    """With the runner's ``post``, edits never wait for the lock: they apply
+    when the runner gets to them, between two steps."""
+
+    def setUp(self):
+        theme.apply(app, "vector")
+        self.sim    = Simulation(seed=0)
+        self.lock   = CountingLock()
+        self.posted = Posted()
+        self.arena  = ArenaView(self.sim, self.lock, post=self.posted)
+        self.arena.resize(800, 600)
+        self.arena.show()
+        app.processEvents()
+        self.seen = []
+        self.arena.worldEdited.connect(lambda: self.seen.append("world"))
+        self.arena.receiversEdited.connect(lambda: self.seen.append("receivers"))
+
+    def tearDown(self):
+        self.arena.close()
+        self.arena.deleteLater()
+
+    def test_dragging_and_turning_a_receiver_are_posted(self):
+        self.arena.set_mode("receiver")
+        r     = self.sim.receivers[0]
+        start = r.position.copy()
+        q     = self.arena.view.px(*start)
+        drag(self.arena, (q.x(), q.y()), (q.x() + 40, q.y()))
+        np.testing.assert_array_equal(r.position, start)                  # not yet: a step is "running"
+        self.posted.run()
+        np.testing.assert_allclose(r.position, start + [40 / self.arena.view.scale, 0], atol=1e-6)
+        facing = r.facing_deg
+        q      = self.arena.view.px(*r.position)
+        wheel(self.arena, q.x(), q.y())
+        self.assertEqual(r.facing_deg, facing)
+        self.posted.run()
+        self.assertAlmostEqual(r.facing_deg, facing + 5.0)
+        self.assertEqual(self.seen, ["receivers", "receivers"])
+        self.assertEqual(self.lock.entered, 0)
+
+    def test_adding_and_deleting_obstacles_are_posted(self):
+        self.arena.set_mode("obstacle")
+        drag(self.arena, (380, 280), (440, 320))
+        self.assertEqual(self.sim.world.obstacles, [])
+        self.posted.run()
+        (first,) = self.sim.world.obstacles
+        drag(self.arena, (520, 100), (580, 150))                           # a second box, still pending ...
+        click(self.arena, 410, 300, RIGHT)                                 # ... when the first is deleted
+        self.assertEqual(self.sim.world.obstacles, [first])
+        self.posted.run()
+        (second,) = self.sim.world.obstacles
+        self.assertIsNot(second, first)
+        self.assertEqual(second.name, "box 2")
+        self.assertEqual(self.seen, ["world", "world", "world"])
+        self.assertEqual(self.lock.entered, 0)
 
 
 class HatchTest(unittest.TestCase):

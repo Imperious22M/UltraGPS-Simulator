@@ -4,6 +4,7 @@
 import hashlib
 import os
 import unittest
+from itertools import combinations
 
 import numpy as np
 
@@ -12,6 +13,7 @@ from engine.calibration import Calibrator, read_offsets, set_cal_points
 from engine.config import DEFAULT_CONFIG, DEFAULT_SENSORS
 from engine.hardware import Faults
 from engine.simulation import Simulation
+from engine import solvers as S
 from engine.solvers import ALGORITHMS
 from ultragps_position import load_config
 
@@ -59,14 +61,48 @@ class LibraryTest(unittest.TestCase):
         self.assertNotIn(0, frame.estimates["CEP"].used)
         self.assertLess(sim.stats("CEP")[0], 5.0)
 
-    def test_cep_tries_every_subset_of_three_or_more(self):
+    def _cep_subsets_tried(self, setting: str) -> list:
         sim = ideal_sim(noise=1.0)
+        sim.solvers.settings.cep_subsets = setting
         calls = []
         real = sim.solvers.lib._compute_cep
         sim.solvers.lib._compute_cep = lambda d, idx: calls.append(tuple(idx)) or real(d, idx)
         run(sim, [30, 50], frames=1)
+        return calls
+
+    def test_cep_tries_the_subsets_ultragps_control_tries(self):
+        self.assertEqual(S.CONTROL_MAX_SUBSETS, 15)       # get_position_full's default
+        calls = self._cep_subsets_tried("control")
+        # All six, then the first 14 three-receiver subsets: every one holds R0 or R1
+        self.assertEqual(calls, [tuple(range(6))] + list(combinations(range(6), 3))[:14])
+        self.assertNotIn((2, 4, 5), calls)
+
+    def test_cep_can_try_every_subset_of_three_or_more(self):
+        calls = self._cep_subsets_tried("all")
         # 6 receivers: C(6,3) + C(6,4) + C(6,5) + C(6,6) = 20 + 15 + 6 + 1
         self.assertEqual(len(set(calls)), 42)
+        self.assertEqual(S.cep_max_subsets(S.Settings(cep_subsets="all"), 6), 64)
+        self.assertEqual(S.cep_max_subsets(S.Settings(), 6), 15)
+
+    def test_control_cep_cannot_drop_r0_and_r1_together(self):
+        # Both read long (echoes): every subset UltraGPS-Control tries holds one of them
+        truth = np.array([30.0, 50.0])
+        sim = ideal_sim()
+        lib = sim.solvers.lib
+        d = np.hypot(*(lib._receiver_coords - truth).T)
+        d[0] += 40.0
+        d[1] += 25.0
+        ticks = [round((v - lib._offsets[i]["intercept"]) / lib._offsets[i]["slope"]) for i, v in enumerate(d)]
+        err = {}
+        for setting in ("control", "all"):
+            sim.solvers.settings.cep_subsets = setting
+            sim.solvers.reset()
+            cep = sim.solvers.solve(ticks).estimates["CEP"]
+            err[setting] = float(np.hypot(*(cep.pos - truth)))
+            if setting == "all":
+                self.assertFalse({0, 1} & set(cep.used))
+        self.assertLess(err["all"], 1.0)
+        self.assertGreater(err["control"], 10.0)
 
     def test_cep_reports_no_subset_when_holding_last_fix(self):
         sim = ideal_sim(noise=1.0)

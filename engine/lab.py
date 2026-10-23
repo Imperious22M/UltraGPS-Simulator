@@ -8,12 +8,16 @@ the library code is not changed, only watched:
                     (``_ticks_to_distances``, ``_filter_receivers``)
 * ``trace_cep``     every subset ``_find_best_subset`` evaluates, in its order,
                     with the seed, fit, residuals, weights, covariance and CEP
-                    ``_compute_cep`` produced, then ``_validate_position``
+                    ``_compute_cep`` produced, then ``_validate_position``.
+                    With a ``max_subsets`` cap (UltraGPS-Control's 15) the
+                    subsets past it are scored too, marked as beyond the
+                    library's search, to show what it never looks at
 * ``trace_lm``      every point the library's ``_nlls`` (scipy's MINPACK
                     Levenberg-Marquardt) evaluates on its way from an initial
                     guess to the fix
 * ``sweep``         how each algorithm's fix moves as one receiver's reading
-                    goes wrong (e.g. blocked, reading a reflection)
+                    goes wrong (e.g. blocked, reading a reflection); the
+                    library's bounds check is applied at every offset
 
 Watching works by wrapping the instance's methods, and the module's
 ``least_squares`` for the LM trace, for the duration of one call.
@@ -21,9 +25,11 @@ Watching works by wrapping the instance's methods, and the module's
 
 from __future__ import annotations
 
+import math
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from itertools import combinations
 
 import numpy as np
 
@@ -55,10 +61,15 @@ class FilterTrace:
     sane: list
 
 
+def top_band(lib: UltraGPSPositionLib) -> float:
+    """The library's bounds check keeps a reading d with 0 < d ≤ this."""
+    return lib.max_distance if lib.max_distance is not None else lib._max_receiver_dist
+
+
 def trace_filter(lib: UltraGPSPositionLib, ticks) -> FilterTrace:
     """Run the library's filter on ``ticks`` and explain each receiver's verdict."""
     prev = None if lib._last_distances is None else lib._last_distances.copy()
-    top  = lib.max_distance if lib.max_distance is not None else lib._max_receiver_dist
+    top  = top_band(lib)
     d    = lib._ticks_to_distances(ticks)
     sane = [int(i) for i in lib._filter_receivers(d)]
     rows = []
@@ -89,11 +100,30 @@ class SubsetStep:
 class CepTrace:
     distances: np.ndarray
     sane: list
-    steps: list
-    best: int | None        # index into steps of the winner
+    steps: list             # every subset of 3+ kept receivers, in the library's order
+    best: int | None        # index into steps of the winner (of the subsets searched)
     position: np.ndarray | None   # after _validate_position
     rejected: bool          # winner outside the receivers' box
     box: tuple
+    searched: int = 0       # the library's search scores steps[:searched] (max_subsets); the rest only here
+    best_all: int | None = None   # the winner had every subset been scored
+
+
+def searched_count(n_sane: int, max_subsets: int) -> int:
+    """How many subsets ``_find_best_subset`` scores with ``max_subsets``: the
+    full set, then subsets of 3, 4, … receivers until it has ``max_subsets``."""
+    count = 1
+    for k in range(3, n_sane):
+        for _ in combinations(range(n_sane), k):
+            count += 1
+            if count >= max_subsets:
+                return count
+    return count
+
+
+def winner(steps: list, count: int) -> int | None:
+    """The library's winner among ``steps[:count]``: the last one that was best so far."""
+    return next((k for k in reversed(range(min(count, len(steps)))) if steps[k].best), None)
 
 
 @contextmanager
@@ -108,10 +138,12 @@ def _watch(lib, name, wrapper):
 
 
 def trace_cep(lib: UltraGPSPositionLib, distances, sane: list, max_subsets: int | None = None) -> CepTrace:
-    """Run ``_find_best_subset`` and record every subset it scores."""
-    n           = lib.receiver_count
-    max_subsets = max_subsets or 2 ** n
-    d           = tuple(float(v) for v in distances)
+    """Run ``_find_best_subset`` over every subset and record each one it
+    scores.  The library with ``max_subsets`` (default: no limit) scores the
+    first ``searched`` of them, and the winner, its box check and the fix are
+    those of that search; ``best_all`` is the winner of them all."""
+    n    = lib.receiver_count
+    d    = tuple(float(v) for v in distances)
     steps, fits = [], []
 
     def nlls(orig, dist, initial, idx):
@@ -129,13 +161,15 @@ def trace_cep(lib: UltraGPSPositionLib, distances, sane: list, max_subsets: int 
         return pos, cep, cov
 
     with _watch(lib, "_nlls", nlls), _watch(lib, "_compute_cep", compute):
-        best_pos, best_cep, best_idx, _ = lib._find_best_subset(d, list(sane), max_subsets)
-    pos, invalid = lib._validate_position(best_pos)
+        lib._find_best_subset(d, list(sane), 2 ** n)
+    searched = len(steps) if max_subsets is None else min(searched_count(len(sane), max_subsets), len(steps))
+    best     = winner(steps, searched)       # the subsets come in the same order whatever the limit
+    pos, invalid = lib._validate_position(None if best is None else steps[best].pos)
     c   = lib._receiver_coords
     box = (float(c[:, 0].min()), float(c[:, 1].min()), float(c[:, 0].max()), float(c[:, 1].max()))
-    best = next((k for k, s in enumerate(steps) if s.subset == best_idx), None)
     return CepTrace(np.array(d), list(sane), steps, best,
-                    None if pos is None else np.array(pos, dtype=float), bool(invalid), box)
+                    None if pos is None else np.array(pos, dtype=float), bool(invalid), box,
+                    searched, winner(steps, len(steps)))
 
 
 # ─── Levenberg-Marquardt path ────────────────────────────────────────────────
@@ -259,42 +293,70 @@ class Sweep:
     paths: dict                         # {algorithm: (k, 2) fixes, nan where none}
     cep_subsets: list                   # subset the library's CEP chose at each offset
     cep_rejected: list                  # library CEP fix outside the box
+    in_band: list = field(default_factory=list)   # the swept reading passes the bounds check, at each offset
+    top_band: float = math.inf          # the bounds check's limit, cm
+    kept: list = field(default_factory=list)      # receivers the library keeps (and solves with), at each offset
+
+    @property
+    def dropped(self) -> int | None:
+        """The first step at which the bounds check drops the swept reading (too far)."""
+        return next((k for k, ok in enumerate(self.in_band) if not ok), None)
 
 
 def static_solve(lib: UltraGPSPositionLib, d, idx, settings: S.Settings | None = None) -> dict:
-    """Every snapshot algorithm on distances ``d`` from receivers ``idx``, with
-    no memory between calls (the EKF is left out: it needs a history)."""
+    """Every snapshot algorithm on distances ``d`` from receivers ``idx`` (the
+    library filter's kept ones), with no memory between calls (the EKF is left
+    out: it needs a history).  As in ``Solvers.solve``: the library's CEP tries
+    as many subsets as ``settings.cep_subsets`` allows, and with
+    ``filter_mode = "bounds"`` the simulator algorithms get every receiver
+    within the bounds instead of ``idx``."""
     settings = settings or S.Settings()
-    d   = np.asarray(d, dtype=float)
-    idx = list(idx)
-    out = {}
+    d    = np.asarray(d, dtype=float)
+    idx  = list(idx)
+    top  = top_band(lib)
+    inb  = [i for i, v in enumerate(d) if 0 < v <= top]
+    isim = idx if settings.filter_mode == "library" else inb
+    out  = {}
     if len(idx) >= 3:
+        c = lib._receiver_coords
         out["OLS"] = S.Estimate(lib._ols(d, np.array(idx)), True, idx)
         pos, r = lib._multilaterate(tuple(d), np.array(idx))
         out["LM"] = S.Estimate(np.array(pos), bool(r.success), idx)
-        best_pos, cep, best_idx, cov = lib._find_best_subset(tuple(d), idx, 2 ** lib.receiver_count)
-        c = lib._receiver_coords
+        best_pos, cep, best_idx, score = lib._find_best_subset(
+            tuple(d), idx, S.cep_max_subsets(settings, lib.receiver_count))
         inside = (best_pos is not None and c[:, 0].min() <= best_pos[0] <= c[:, 0].max()
                   and c[:, 1].min() <= best_pos[1] <= c[:, 1].max())
-        out["CEP"] = S.Estimate(np.array(best_pos), bool(inside), list(best_idx or []), cov,
-                                f"CEP {cep:.1f} cm" + ("" if inside else ", outside the box"))
-    out["CEP4"]   = S.solve_cep4(lib, d, idx)
-    out["ROBUST"] = S.solve_robust(lib, d, idx, settings.robust_scale_cm)
-    out["BIAS"]   = S.solve_bias(lib, d, idx)
-    out["RANSAC"] = S.solve_ransac(lib, d, idx, settings.ransac_tol_cm)
+        best   = list(best_idx or [])
+        # As Solvers does: the winning subset's geometry, with the noise level LM sees over every kept receiver
+        lm_res = S.ranges_from(c[idx], pos) - d[idx]
+        cov    = S.covariance(c[best], best_pos, None, s2=S.noise_var(lm_res)) if inside and best else None
+        out["CEP"] = S.Estimate(None if best_pos is None else np.array(best_pos), bool(inside), best, cov,
+                                f"CEP {cep:.1f} cm" + ("" if inside else ", outside the box"), score)
+    out["CEP4"]   = S.solve_cep4(lib, d, isim)
+    out["ROBUST"] = S.solve_robust(lib, d, isim, settings.robust_scale_cm)
+    out["BIAS"]   = S.solve_bias(lib, d, isim)
+    out["RANSAC"] = S.solve_ransac(lib, d, isim, settings.ransac_tol_cm)
     return out
 
 
 def sweep(lib: UltraGPSPositionLib, distances, idx, receiver: int, max_offset: float = 150.0,
-          steps: int = 61, settings: S.Settings | None = None) -> Sweep:
+          steps: int = 61, settings: S.Settings | None = None, cancel=None) -> Sweep | None:
     """Add 0..``max_offset`` cm to one receiver's reading (as when it hears a
-    reflection instead of the blocked direct sound) and solve at each step."""
+    reflection instead of the blocked direct sound) and solve at each step.
+    The library's bounds check is applied at every offset: once the reading is
+    past the top band it is dropped.  The jump check is not: the readings are
+    taken to have been like this for a while (steady state).  ``cancel``, a
+    ``threading.Event``, stops it between offsets; it then returns None."""
     offsets = np.linspace(0.0, max_offset, steps)
-    paths, subsets, rejected = {}, [], []
+    top     = top_band(lib)
+    paths, subsets, rejected, in_band, kept = {}, [], [], [], []
     for k, off in enumerate(offsets):
+        if cancel is not None and cancel.is_set():
+            return None
         d = np.array(distances, dtype=float)
         d[receiver] += off
-        res = static_solve(lib, d, idx, settings)
+        kept.append([i for i in idx if 0 < d[i] <= top])
+        res = static_solve(lib, d, kept[-1], settings)
         for a, e in res.items():
             paths.setdefault(a, np.full((steps, 2), np.nan))
             if e.pos is not None:
@@ -302,4 +364,5 @@ def sweep(lib: UltraGPSPositionLib, distances, idx, receiver: int, max_offset: f
         cep = res.get("CEP")
         subsets.append(cep.used if cep else [])
         rejected.append(bool(cep and not cep.ok))
-    return Sweep(receiver, offsets, paths, subsets, rejected)
+        in_band.append(bool(0 < d[receiver] <= top))
+    return Sweep(receiver, offsets, paths, subsets, rejected, in_band, float(top), kept)

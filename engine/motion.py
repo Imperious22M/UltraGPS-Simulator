@@ -6,6 +6,11 @@ Modes: ``target`` (drive to a clicked point and stop), ``circle``, ``figure8``,
 waypoints inside the arena).  The transmitter drives at ``speed`` cm/s and
 faces the way it is going (its heading), which matters when its own beam
 pattern is on.
+
+It never drives into or through an obstacle: ``clip_move`` tests the whole
+step, not just where it ends, and stops it just short of the first edge.  One
+that is already inside an obstacle (drawn over it, or put there) may drive out;
+``push_out`` moves a point inside an obstacle to just outside it.
 """
 
 from __future__ import annotations
@@ -15,6 +20,60 @@ import math
 import numpy as np
 
 MODES = ("target", "circle", "figure8", "lawnmower", "random")
+
+
+def _cross(a, b):
+    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+
+def clip_move(p, q, obstacles, margin: float = 0.5) -> tuple[np.ndarray, bool]:
+    """How far the move ``p``→``q`` can go: ``(q, False)``, or a point ``margin``
+    cm short of the first obstacle edge it would touch and ``True``.  Obstacles
+    that already contain ``p`` are ignored, so it can always leave one."""
+    p, q = np.asarray(p, dtype=float), np.asarray(q, dtype=float)
+    r    = q - p
+    L    = float(np.hypot(*r))
+    t    = math.inf
+    for o in obstacles:
+        if o.contains(p):
+            continue
+        a   = np.asarray(o.points, dtype=float)
+        s   = np.roll(a, -1, axis=0) - a
+        den = _cross(r, s)
+        ok  = np.abs(den) > 1e-12
+        den = np.where(ok, den, 1.0)
+        ap  = a - p
+        tt  = _cross(ap, s) / den
+        uu  = _cross(ap, r) / den
+        hit = ok & (tt >= 0) & (tt <= 1) & (uu >= 0) & (uu <= 1)
+        if hit.any():
+            t = min(t, float(tt[hit].min()))
+        elif o.contains(q):              # rounding: it ends inside without crossing an edge
+            t = 0.0
+    if t == math.inf:
+        return q, False
+    return p + r * max(0.0, t - margin / max(L, 1e-12)), True
+
+
+def push_out(p, obstacles, margin: float = 1.0) -> np.ndarray:
+    """``p``, or if it is inside an obstacle, the nearest point on that
+    obstacle's edge moved ``margin`` cm outwards."""
+    p = np.asarray(p, dtype=float).copy()
+    for _ in range(len(obstacles)):         # overlapping obstacles: out of one may be into another
+        o = next((o for o in obstacles if o.contains(p)), None)
+        if o is None:
+            break
+        a    = np.asarray(o.points, dtype=float)
+        s    = np.roll(a, -1, axis=0) - a
+        ll   = np.maximum(np.sum(s * s, axis=1), 1e-12)
+        u    = np.clip(np.sum((p - a) * s, axis=1) / ll, 0.0, 1.0)
+        near = a + s * u[:, None]
+        k    = int(np.argmin(np.hypot(*(near - p).T)))
+        n    = np.array([s[k, 1], -s[k, 0]]) / np.sqrt(ll[k])
+        if np.dot(n, a[k] - a.mean(axis=0)) < 0:     # point it away from the inside
+            n = -n
+        p = near[k] + n * margin
+    return p
 
 
 class Motion:
@@ -37,8 +96,8 @@ class Motion:
         self.target = np.asarray(xy, dtype=float)
 
     def blocked(self) -> None:
-        """The way ahead runs into an obstacle.  The transmitter stays where it
-        is; a waypoint mode picks its next waypoint instead."""
+        """The way ahead runs into an obstacle.  The transmitter stops at it;
+        a waypoint mode picks its next waypoint instead."""
         if self.mode in ("lawnmower", "random"):
             self.phase = 0.0
 

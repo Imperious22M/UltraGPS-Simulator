@@ -33,9 +33,15 @@ Candidates are a grid over the receivers' bounding box, shrunk by ``margin``
 cm on every side, keeping only points within the HC-SR04's 400 cm of every
 receiver (otherwise a receiver can't be calibrated there).  The margin keeps
 points away from the receiver walls: a point level with a wall of receivers is
-far off their beams, where readings are weak and late.  2 points: every pair.  3 and 4 points: greedy from the best
-smaller set, then exchange passes (swap one point for any candidate while that
-improves the score), then a fine-grid refinement.
+far off their beams, where readings are weak and late.  Given the room, only
+points inside the walls and outside the obstacles are candidates, and a set
+costs ``BLOCKED_PENALTY`` extra for every point a receiver that is on can't
+see: a receiver calibrated on an echo is wrong everywhere, so a set in every
+receiver's line of sight wins whenever there is one.  No two points of a set
+are closer than ``MIN_SEPARATION_CM``: the same spot read twice repeats its
+range walk and adds nothing.  2 points: every pair.  3 and 4 points: greedy
+from the best smaller set, then exchange passes (swap one point for any
+candidate while that improves the score), then a fine-grid refinement.
 
 Check
 -----
@@ -59,12 +65,15 @@ from itertools import combinations
 
 import numpy as np
 
+from engine.calibration import effective_true
 from engine.config import DEFAULT_CONFIG, DEFAULT_SENSORS
 from engine.hardware import Faults
 from engine.simulation import Simulation
 from ultragps_position import load_config
 
-MAX_RANGE_CM = 400.0
+MAX_RANGE_CM      = 400.0
+MIN_SEPARATION_CM = 20.0          # points closer than this are one point read twice
+BLOCKED_PENALTY   = 1000.0        # per point a receiver can't see: worse than any clear set
 
 
 # ─── Geometry ────────────────────────────────────────────────────────────────
@@ -77,12 +86,44 @@ def grid(coords: np.ndarray, step: float) -> np.ndarray:
     return np.array([(x, y) for x in xs for y in ys])
 
 
-def candidates(coords: np.ndarray, step: float, margin: float = 0.0) -> np.ndarray:
+def candidates(coords: np.ndarray, step: float, margin: float = 0.0, world=None) -> np.ndarray:
+    """Grid points ``margin`` inside the receivers' box and in range of every
+    receiver; with ``world``, only those inside the walls and outside the obstacles."""
     pts = grid(coords, step)
     (x0, y0), (x1, y1) = coords.min(axis=0) + margin, coords.max(axis=0) - margin
     pts = pts[(pts[:, 0] >= x0) & (pts[:, 0] <= x1) & (pts[:, 1] >= y0) & (pts[:, 1] <= y1)]
     far = np.linalg.norm(pts[:, None, :] - coords[None, :, :], axis=2).max(axis=1)
-    return pts[far <= MAX_RANGE_CM]
+    pts = pts[far <= MAX_RANGE_CM].reshape(-1, 2)
+    if world is not None:
+        pts = pts[np.array([world.inside(p) and not any(o.contains(p) for o in world.obstacles)
+                            for p in pts], dtype=bool).reshape(-1)]
+    return pts
+
+
+def unseen(points, world, receivers) -> np.ndarray:
+    """(n, R) bool: receiver r is on but has no line of sight to point n.
+    Receivers that are off or blocked can't be helped, so they never count."""
+    P   = np.asarray(points, dtype=float).reshape(-1, 2)
+    out = np.zeros((len(P), len(receivers)), dtype=bool)
+    for k, r in enumerate(receivers):
+        if r.state == "on" and len(P):
+            out[:, k] = world.blocked_legs(P, np.broadcast_to(np.asarray(r.position, dtype=float), P.shape))
+    return out
+
+
+def too_close(points) -> list[tuple[int, int, float]]:
+    """``(i, j, distance)`` of every two points closer than ``MIN_SEPARATION_CM``."""
+    P = np.asarray(points, dtype=float).reshape(-1, 2)
+    return [(i, j, float(np.hypot(*(P[i] - P[j])))) for i, j in combinations(range(len(P)), 2)
+            if np.hypot(*(P[i] - P[j])) < MIN_SEPARATION_CM - 1e-6]
+
+
+def _crowded(pool: np.ndarray, chosen: np.ndarray) -> np.ndarray:
+    """Which ``pool`` points are closer than ``MIN_SEPARATION_CM`` to one of ``chosen``."""
+    if not len(chosen):
+        return np.zeros(len(pool), dtype=bool)
+    d = np.linalg.norm(pool[:, None, :] - np.asarray(chosen)[None, :, :], axis=2)
+    return (d < MIN_SEPARATION_CM - 1e-6).any(axis=1)
 
 
 def score(dists: np.ndarray, eval_d: np.ndarray) -> np.ndarray:
@@ -112,49 +153,68 @@ def receiver_errors(points: np.ndarray, coords: np.ndarray) -> list[tuple[float,
     return [(1 / np.sqrt(s), np.sqrt(1 / len(points) + db ** 2 / s)) for s, db in zip(sxx, dbar)]
 
 
-def search(coords: np.ndarray, max_points: int, margin: float = 30.0,
-           step: float = 20.0, fine: float = 5.0) -> dict[int, np.ndarray]:
-    """Best point set for each size 2..max_points."""
-    cand   = candidates(coords, step, margin)
+def search(coords: np.ndarray, max_points: int, margin: float = 30.0, step: float = 20.0,
+           fine: float = 5.0, world=None, receivers=None) -> dict[int, np.ndarray]:
+    """Best point set for each size 2..max_points.  With ``world``, only points
+    the transmitter can be at; with ``receivers`` too (where they really are,
+    and their states), points out of a receiver's line of sight are avoided.
+    Raises ValueError when not enough points qualify."""
+    cand = candidates(coords, step, margin, world)
+    if len(cand) < max(max_points, 2):
+        found = ("no point qualifies" if not len(cand) else
+                 f"only {len(cand)} point{' qualifies' if len(cand) == 1 else 's qualify'} for {max_points}")
+        where = ", inside the walls and outside the obstacles" if world is not None else ""
+        raise ValueError(f"{found}: a point must be within {MAX_RANGE_CM:.0f} cm of every receiver and "
+                         f"{margin:g} cm inside their box{where}. Are the receivers too far apart, "
+                         f"or in a line?")
     eval_d = np.linalg.norm(grid(coords, 20.0)[:, None, :] - coords[None, :, :], axis=2)
-    cd     = np.linalg.norm(cand[:, None, :] - coords[None, :, :], axis=2)    # (M, R)
 
-    # 2 points: every pair
-    pairs = np.array(list(combinations(range(len(cand)), 2)))
-    s     = np.concatenate([score(cd[pairs[i:i + 20000]], eval_d)
-                            for i in range(0, len(pairs), 20000)])
-    best  = {2: list(pairs[int(np.argmin(s))])}
+    def pool(pts: np.ndarray) -> tuple:
+        """The points, their distances to the receivers and their line-of-sight penalty."""
+        d   = np.linalg.norm(pts[:, None, :] - coords[None, :, :], axis=2)                 # (M, R)
+        pen = (BLOCKED_PENALTY * unseen(pts, world, receivers).sum(axis=1)
+               if world is not None and receivers is not None else np.zeros(len(pts)))
+        return pts, d, pen
 
-    def exchange(idx: list[int], pool: np.ndarray, pool_d: np.ndarray) -> list[int]:
+    def cost(p: tuple, idx: np.ndarray) -> np.ndarray:
+        return score(p[1][idx], eval_d) + p[2][idx].sum(axis=-1)
+
+    def exchange(idx: list[int], p: tuple) -> list[int]:
         idx = list(idx)
-        cur = score(pool_d[idx], eval_d)
+        cur = float(cost(p, np.array(idx)))
         improved = True
         while improved:
             improved = False
             for slot in range(len(idx)):
-                trial = np.repeat(np.array(idx)[None, :], len(pool), axis=0)
-                trial[:, slot] = np.arange(len(pool))
-                sc = score(pool_d[trial], eval_d)
+                trial = np.repeat(np.array(idx)[None, :], len(p[0]), axis=0)
+                trial[:, slot] = np.arange(len(p[0]))
+                sc = cost(p, trial)
+                sc[_crowded(p[0], p[0][[k for n, k in enumerate(idx) if n != slot]])] = np.inf
                 j  = int(np.argmin(sc))
                 if sc[j] < cur - 1e-12:
-                    idx[slot], cur, improved = j, sc[j], True
+                    idx[slot], cur, improved = j, float(sc[j]), True
         return idx
+
+    # 2 points: every pair (distinct grid points are at least a step apart)
+    coarse = pool(cand)
+    pairs  = np.array(list(combinations(range(len(cand)), 2)))
+    s      = np.concatenate([cost(coarse, pairs[i:i + 20000]) for i in range(0, len(pairs), 20000)])
+    best   = {2: list(pairs[int(np.argmin(s))])}
 
     for n in range(3, max_points + 1):
         base  = best[n - 1]
         trial = np.array([base + [j] for j in range(len(cand))])
-        start = base + [int(np.argmin(score(cd[trial], eval_d)))]
-        best[n] = exchange(start, cand, cd)
-    best[2] = exchange(best[2], cand, cd)
+        sc    = cost(coarse, trial)
+        sc[_crowded(cand, cand[base])] = np.inf
+        best[n] = exchange(base + [int(np.argmin(sc))], coarse)
+    best[2] = exchange(best[2], coarse)
 
     # Fine refinement: let each point move on a finer grid
-    fcand = candidates(coords, fine, margin)
-    fd    = np.linalg.norm(fcand[:, None, :] - coords[None, :, :], axis=2)
+    fpool = pool(candidates(coords, fine, margin, world))
     out   = {}
     for n, idx in best.items():
-        pts  = cand[idx]
-        near = [int(np.argmin(np.linalg.norm(fcand - p, axis=1))) for p in pts]
-        out[n] = fcand[exchange(near, fcand, fd)]
+        near   = [int(np.argmin(np.linalg.norm(fpool[0] - q, axis=1))) for q in cand[idx]]
+        out[n] = fpool[0][exchange(near, fpool)]
     return out
 
 
@@ -167,8 +227,9 @@ def arena_score(points, coords) -> float:
 # ─── Simulated check ─────────────────────────────────────────────────────────
 
 def true_response(sim: Simulation) -> tuple[np.ndarray, np.ndarray]:
-    """Each receiver's true (slope, intercept) from sensors.toml."""
-    return (np.array([r.slope for r in sim.receivers]), np.array([r.intercept for r in sim.receivers]))
+    """Each receiver's true (slope, intercept) from sensors.toml, in the current air."""
+    a, b = zip(*(effective_true(r, sim.env) for r in sim.receivers))
+    return np.array(a), np.array(b)
 
 
 def simulate(points, sim: Simulation, min_reads: int, trials: int) -> dict:
@@ -238,7 +299,11 @@ def main() -> None:
     min_reads = int(cfg.get("calibration_reads", 5))
     current = cfg.get("cal_points", [cfg["cal_point_1"], cfg["cal_point_2"]])
     sets = {"current": np.array(current, dtype=float)}
-    for n, pts in search(sim.coords, args.max_points, args.margin).items():
+    try:
+        found = search(sim.coords, args.max_points, args.margin, world=sim.world, receivers=sim.receivers)
+    except ValueError as exc:
+        raise SystemExit(f"cal_points: {exc}")
+    for n, pts in found.items():
         sets[f"best {n}"] = pts
 
     print(f"Simulated check: noise σ = {args.noise} cm, {args.trials} calibrations per set, "

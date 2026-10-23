@@ -21,12 +21,23 @@ class AcousticsTest(unittest.TestCase):
         self.assertAlmostEqual(ac.speed_of_sound(20), 343.4, delta=0.1)
         self.assertGreater(ac.speed_of_sound(20, 100), ac.speed_of_sound(20, 0))
 
+    def test_humidity_matters_more_in_warm_air(self):
+        moist = {t: ac.speed_of_sound(t, 100) - ac.speed_of_sound(t, 0) for t in (0, 20, 30, 45)}
+        self.assertAlmostEqual(moist[20], 1.27, delta=0.1)               # saturated vs dry at 20 °C
+        self.assertAlmostEqual(moist[30], 2.4, delta=0.2)
+        self.assertAlmostEqual(moist[45], 5.6, delta=0.3)
+        self.assertEqual(list(moist.values()), sorted(moist.values()))
+
     def test_beam_is_minus_6_db_at_its_half_angle_and_falls_off(self):
         self.assertAlmostEqual(ac.directivity(0, 27.5), 1.0)
         self.assertAlmostEqual(ac.directivity(27.5, 27.5), 0.5, places=3)
-        levels = [ac.directivity(a, 27.5) for a in range(0, 90, 5)]
-        self.assertEqual(levels, sorted(levels, reverse=True))          # no nulls
         self.assertEqual(ac.directivity(180, 27.5), ac.BACK_LEVEL)
+        angles = np.arange(0.0, 180.0001, 0.1)
+        for half in (5.0, 10.0, 15.0, 27.5, 45.0, 80.0):
+            db = 20 * np.log10([ac.directivity(a, half) for a in angles])
+            self.assertTrue(np.all(np.diff(db) <= 1e-9), half)           # no nulls, no upward steps
+            self.assertLess(np.max(np.abs(np.diff(db))), 1.0, half)      # and no cliff (was 14 dB at 90°)
+            self.assertAlmostEqual(ac.directivity(120, half), ac.BACK_LEVEL)
 
     def test_weak_bursts_are_detected_later_or_not_at_all(self):
         cycles = [ac.detect_cycle(r, 6.0) for r in (100, 10, 3, 1.5)]
@@ -34,6 +45,25 @@ class AcousticsTest(unittest.TestCase):
         self.assertGreater(cycles[-1], cycles[0])
         self.assertIsNone(ac.detect_cycle(1.2, 6.0))                     # never crosses in 8 cycles
         self.assertIsNone(ac.detect_cycle(0.9, 6.0))
+        self.assertIsNone(ac.detect_cycle(float("nan"), 6.0))
+
+    def test_overlapping_bursts_add_as_phasors(self):
+        C = ac.CYCLE_MS
+        for ratio, start, rise in ((1.5, 10.0, 6.0), (40.0, 3.3, 2.0), (1.37, 7.0, 6.0), (0.9, 5.0, 6.0)):
+            k   = ac.detect_cycle(ratio, rise)
+            hit = ac.first_detection([start], [ratio], rise)
+            if k is None:
+                self.assertIsNone(hit)
+            else:
+                self.assertAlmostEqual(hit[0], start + k * C, places=9)     # alone: exactly detect_cycle
+        self.assertIsNone(ac.detect_cycle(0.9, 6.0))
+        both = ac.first_detection([10.0, 10.0], [0.9, 0.9], 6.0)           # in phase: twice as strong
+        self.assertAlmostEqual(both[0], 10.0 + ac.detect_cycle(1.8, 6.0) * C)
+        self.assertIsNone(ac.first_detection([10.0, 10.0 + 0.5 * C], [0.9, 0.9], 6.0))   # out of phase
+        self.assertIsNone(ac.first_detection([10.0, 10.0 + 2.5 * C], [2.0, 1.8], 6.0))   # an echo cancels it
+        far = ac.first_detection([10.0, 12.0], [2.0, 1.8], 6.0)            # no overlap: the first alone
+        self.assertAlmostEqual(far[0], 10.0 + ac.detect_cycle(2.0, 6.0) * C)
+        self.assertEqual(far[1], 0)
 
 
 class WorldTest(unittest.TestCase):
