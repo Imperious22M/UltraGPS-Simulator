@@ -14,7 +14,7 @@ Python 3.11 or later:
 ```bash
 python3 -m pip install -r requirements.txt
 python3 app.py
-python3 app.py --config path/to/config.toml --max-differential 50 --max-distance 400 --seed 1
+python3 app.py --config path/to/config.toml --sensors path/to/sensors.toml --max-differential 50 --max-distance 400 --seed 1
 ```
 
 It reads receiver positions and calibration from `config/config.toml`, a copy
@@ -24,12 +24,14 @@ of UltraGPS-Control's config, so the arena matches the real one. Point
 ## Relationship to the other UltraGPS repositories
 
 This repository is self-contained and does not modify or depend on any other
-repository at run time. Two things are copied in from
+repository at run time. These are copied in from
 [UltraGPS-Control](https://github.com/Imperious22M/UltraGPS-Control) at commit
 `f8f4f73`:
 
 - `ultragps_position/` — the positioning library (`libs/ultragps_position`)
-- `config/config.toml` — receiver positions and calibration (unmodified)
+- `ultragps_calibration/` — the calibration library (`libs/ultragps_calibration`), unmodified
+- `config/config.toml` — receiver positions and calibration; the simulator's
+  calibration routine and calibration window write new offsets into it
 
 The library copy has **two changes** from that commit, both in the sanity
 filter `_filter_receivers`:
@@ -74,6 +76,8 @@ these changes (`diff` against UltraGPS-Control shows them).
 | Top-band reject | The library filter drops any distance above this (default: widest receiver spacing) |
 | Timestep | Simulated seconds per frame, and the time between frames when running |
 | **Pause** / **Step** | Stop the run / advance exactly one frame (Step pauses first) |
+| **Calibrate** | Run the calibration library's two-point routine on the simulated sensors (see below) |
+| **Modify calibration values** | Open a window to edit each receiver's slope and intercept, then **Save & apply** |
 
 The panel on the right shows each algorithm's current and RMS error against the
 true position, how many frames it failed, which receivers the library's filter
@@ -114,6 +118,38 @@ because the simulator calls `get_position_full()` exactly as UltraGPS-Control's
   With fewer than 4 kept receivers it holds its last fix, and with exactly 4
   kept it has no subset to choose, so a bad reading among those 4 gets through.
 
+## Calibration
+
+There are two sets of per-receiver offsets (`distance_cm = tick × slope + intercept`):
+
+| File | What it is | Used by |
+|------|-----------|---------|
+| `config/sensors.toml` | The simulated hardware's **true** response | The sensor model, to turn distances into ticks |
+| `config/config.toml` | The **calibration**, what the system believes | The positioning library, to turn ticks back into distances |
+
+Both start from the real calibration. When they differ, every distance the
+library sees is off by the calibration error, as on the real system.
+
+**Calibrate** runs `UltraGPSCalibration.run_full_calibration()` from the real
+calibration library. `SimClient` in `calibration.py` stands in for the network
+client: each `pulse()` measures the simulated sensors with the transmitter
+parked on `cal_point_1` (P1 on the arena), then `cal_point_2` (P2). The library
+collects readings until each receiver's most frequent tick has been seen
+`calibration_reads` times, fits slope and intercept from the two points, and
+writes them to `config.toml`. The simulator then reloads the positioning
+library, so the new offsets are used straight away. The current noise, faults,
+temperature and switched-off receivers all apply during calibration, so you
+can see how they turn into calibration error. A receiver whose two calibration
+distances are close together (R3: 292 vs 276 cm) gets a noticeably less
+accurate slope, because a one-tick difference matters more over a short span.
+
+**Modify calibration values** opens a window listing each receiver's slope and
+intercept from `config.toml`, with the true values from `sensors.toml` for
+reference. **Save & apply** writes the edited values through the calibration
+library's `save_offsets()` and reloads the positioning library. **Reload from
+file** discards unsaved edits. To model hardware that has drifted from its
+calibration, edit `sensors.toml` instead.
+
 ## Sensor model
 
 `sensor_model.py` turns a true position into ticks: straight-line range,
@@ -122,8 +158,8 @@ Ranges beyond the HC-SR04's 400 cm read as 0 ticks. A lost signal reads as the
 distance sound travels in the HC-SR04's ~38 ms echo timeout (datasheet value;
 the real board's figure may differ). A bad value is the measured range scaled
 by a random factor within ±"Bad value range" %. Distances are converted to
-ticks by inverting each receiver's calibration (`tick = (d - intercept) / slope`),
-so the library's own `tick * slope + intercept` recovers them.
+ticks by inverting each receiver's true response from `sensors.toml`
+(`tick = (d - intercept) / slope`).
 
 ## Code layout
 
@@ -131,7 +167,10 @@ so the library's own `tick * slope + intercept` recovers them.
 |------|------|
 | `sensor_model.py` | Physics and faults: position → ticks |
 | `solvers.py` | Runs each algorithm in the library on one frame |
-| `ultragps_position/` | Copy of the positioning library (unmodified) |
+| `calibration.py` | Runs the calibration library on the simulated sensors; reads and saves offsets |
+| `ultragps_position/` | Copy of the positioning library (two filter changes, above) |
+| `ultragps_calibration/` | Copy of the calibration library (unmodified) |
+| `config/sensors.toml` | The simulated hardware's true tick response |
 | `simulation.py` | Run state: moves the transmitter, steps sensor + solvers, tracks error |
-| `app.py` | Matplotlib window and controls |
+| `app.py` | Matplotlib windows: simulator and calibration values |
 | `test_simulator.py` | Headless checks: `python3 -m unittest test_simulator` |

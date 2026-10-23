@@ -13,19 +13,22 @@ from collections import deque
 import numpy as np
 
 from sensor_model import Faults, SensorModel
-from solvers import ALGORITHMS, DEFAULT_CONFIG, Solvers, load_calibration
+from solvers import ALGORITHMS, DEFAULT_CONFIG, DEFAULT_SENSORS, Solvers, load_sensors
 
 
 class Simulation:
     def __init__(
         self,
         config_path: str = DEFAULT_CONFIG,
+        sensors_path: str = DEFAULT_SENSORS,
         max_differential: float = 50.0,
         max_distance: float | None = None,
         history: int = 100,
         seed: int | None = None,
     ):
-        coords, slopes, intercepts = load_calibration(config_path)
+        # The sensors use the simulated hardware's true response; the solvers
+        # use the calibration in config_path, which may differ from it.
+        coords, slopes, intercepts = load_sensors(config_path, sensors_path)
         self.sensor  = SensorModel(coords, slopes, intercepts, seed=seed)
         self.solvers = Solvers(config_path, max_differential, max_distance)
         self.coords  = coords
@@ -49,6 +52,11 @@ class Simulation:
             self.fails[a] = 0
         self.frames = 0
         self.time   = 0.0
+
+    def reload_calibration(self) -> None:
+        """Re-read the offsets in config.toml into the positioning library."""
+        self.solvers.lib.reload()
+        self.reset()
 
     def step(self, dt: float = 0.1) -> dict:
         # Move toward the target at a fixed speed

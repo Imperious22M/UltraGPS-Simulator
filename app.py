@@ -1,12 +1,15 @@
 """
 UltraGPS positioning simulator — interactive window.
 
-    python3 app.py [--config config/config.toml] [--max-differential 50] [--max-distance 400]
+    python3 app.py [--config config/config.toml] [--sensors config/sensors.toml]
+                   [--max-differential 50] [--max-distance 400]
 
 Click the arena to send the transmitter somewhere, toggle receivers on and off,
 and drag the sliders to add noise and faults.  Every algorithm in the real
 positioning library solves each frame side by side, with its error against the
-true position shown live.
+true position shown live.  "Calibrate" runs the real calibration library's
+two-point routine on the simulated sensors; "Modify calibration values" opens a
+window to edit each receiver's slope and intercept.
 """
 
 from __future__ import annotations
@@ -16,10 +19,11 @@ import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button, CheckButtons, Slider
+from matplotlib.widgets import Button, CheckButtons, Slider, TextBox
 
+from calibration import Calibrator, read_offsets
 from simulation import Simulation
-from solvers import ALGORITHMS, DEFAULT_CONFIG
+from solvers import ALGORITHMS, DEFAULT_CONFIG, DEFAULT_SENSORS
 
 DT          = 0.1   # default s per frame — the base station's default 10 Hz
 COLORS      = {"OLS": "tab:orange", "LM": "tab:blue", "CEP": "tab:green", "CEP4": "tab:purple"}
@@ -30,9 +34,67 @@ STATUS_FILL = {"ok": "tab:green", "off": "lightgray", "dropout": "tab:orange",
 PATH_RADIUS = 100.0
 
 
+class CalibrationEditor:
+    """Separate window: one row per receiver with editable slope and intercept.
+    "Save & apply" writes them to config.toml through the calibration library
+    and reloads the positioning library."""
+
+    def __init__(self, calibrator: Calibrator):
+        self.cal    = calibrator
+        self.fig    = plt.figure("Modify calibration values", figsize=(7, 5.5))
+        n           = len(calibrator.sim.coords)
+        self.fig.text(0.05, 0.93, "distance_cm = tick × slope + intercept", weight="bold")
+        for x, title in ((0.18, "slope"), (0.43, "intercept (cm)"), (0.70, "sensor truth (sensors.toml)")):
+            self.fig.text(x, 0.86, title, fontsize=9)
+        self.slope, self.icpt = [], []
+        sensor = calibrator.sim.sensor
+        for i in range(n):
+            y = 0.78 - i * 0.09
+            self.fig.text(0.05, y + 0.01, f"R{i}", weight="bold")
+            self.slope.append(TextBox(self.fig.add_axes([0.18, y, 0.20, 0.055]), ""))
+            self.icpt.append(TextBox(self.fig.add_axes([0.43, y, 0.20, 0.055]), ""))
+            self.fig.text(0.70, y + 0.015, f"{sensor.slopes[i]:.4f}   {sensor.intercepts[i]:8.2f}",
+                          family="monospace", fontsize=9, color="gray")
+        self.b_save   = Button(self.fig.add_axes([0.18, 0.10, 0.20, 0.06]), "Save & apply")
+        self.b_reload = Button(self.fig.add_axes([0.43, 0.10, 0.20, 0.06]), "Reload from file")
+        self.b_save.on_clicked(self._on_save)
+        self.b_reload.on_clicked(lambda _: self.load())
+        self.status = self.fig.text(0.05, 0.03, "", fontsize=9)
+        self.seen   = -1
+        self.refresh()
+        self.fig.show()
+
+    def refresh(self) -> None:
+        """Reload the fields if the offsets changed since this window last saw them."""
+        if self.seen != self.cal.version:
+            self.load()
+
+    def load(self) -> None:
+        offsets = read_offsets(self.cal.config_path)
+        for i, (sb, ib) in enumerate(zip(self.slope, self.icpt)):
+            sb.set_val(f"{offsets[i]['slope']:.6f}")
+            ib.set_val(f"{offsets[i]['intercept']:.4f}")
+        self.seen = self.cal.version
+        self.status.set_text(f"Loaded from {self.cal.config_path}")
+        self.fig.canvas.draw_idle()
+
+    def _on_save(self, _) -> None:
+        try:
+            offsets = {i: {"slope": float(sb.text), "intercept": float(ib.text)}
+                       for i, (sb, ib) in enumerate(zip(self.slope, self.icpt))}
+            self.cal.save(offsets)
+            self.seen = self.cal.version
+            self.status.set_text("Saved to config.toml and applied")
+        except (ValueError, RuntimeError) as exc:
+            self.status.set_text(f"Not saved: {exc}")
+        self.fig.canvas.draw_idle()
+
+
 class App:
-    def __init__(self, sim: Simulation):
+    def __init__(self, sim: Simulation, config_path: str = DEFAULT_CONFIG):
         self.sim     = sim
+        self.calib   = Calibrator(sim, config_path)
+        self.editor  = None
         self.paused  = False
         self.on_path = False
         self.angle   = 0.0
@@ -68,6 +130,11 @@ class App:
             ax.annotate(f"R{i}", (x, y), xytext=(0, 12), textcoords="offset points",
                         ha="center", fontsize=9)
 
+        cal = self.calib.cal
+        for k, pt in ((1, cal.cal_point_1), (2, cal.cal_point_2)):
+            ax.plot(*pt, "s", mfc="none", mec="gray", ms=9)
+            ax.annotate(f"P{k}", pt, xytext=(6, -12), textcoords="offset points", fontsize=8, color="gray")
+
         self.trail = {a: ax.plot([], [], "-", color=COLORS[a], alpha=0.4, lw=1)[0]
                       for a in ALGORITHMS}
         self.est   = {a: ax.plot([], [], "o", color=COLORS[a], ms=9, label=LABELS[a])[0]
@@ -96,7 +163,7 @@ class App:
             return s
         lib = self.sim.solvers.lib
         top = lib.max_distance if lib.max_distance is not None else lib._max_receiver_dist
-        rows = iter(0.70 - 0.033 * i for i in range(10))
+        rows = iter(0.70 - 0.03 * i for i in range(10))
         self.s_noise   = slider(next(rows), "Noise σ (cm)",         0, 20,   fl.noise_cm,           "%.1f")
         self.s_drop    = slider(next(rows), "Dropouts (%)",         0, 50,   fl.dropout_rate * 100, "%.0f")
         self.s_timeout = slider(next(rows), "Lost signal (%)",      0, 50,   fl.timeout_rate * 100, "%.0f")
@@ -107,7 +174,7 @@ class App:
         self.s_top     = slider(next(rows), "Top-band reject (cm)", 50, 1500, top,                  "%.0f")
         self.s_dt      = slider(next(rows), "Timestep (s)",      0.02, 1.0,  self.dt,               "%.2f")
 
-        y = 0.36
+        y = 0.405
         self.b_pause = Button(f.add_axes([0.64, y, 0.08, 0.04]), "Pause")
         self.b_step  = Button(f.add_axes([0.73, y, 0.08, 0.04]), "Step")
         self.b_path  = Button(f.add_axes([0.82, y, 0.08, 0.04]), "Circle path")
@@ -116,6 +183,12 @@ class App:
         self.b_step.on_clicked(self._on_step)
         self.b_path.on_clicked(self._on_path)
         self.b_reset.on_clicked(lambda _: self.sim.reset())
+
+        y = 0.355
+        self.b_calib = Button(f.add_axes([0.64, y, 0.17, 0.04]), "Calibrate")
+        self.b_edit  = Button(f.add_axes([0.82, y, 0.17, 0.04]), "Modify calibration values")
+        self.b_calib.on_clicked(self._on_calibrate)
+        self.b_edit.on_clicked(self._on_edit)
 
         self.info = f.text(0.64, 0.335, "", family="monospace", fontsize=8.5, va="top")
 
@@ -156,13 +229,29 @@ class App:
         self.advance()
         self.fig.canvas.draw_idle()
 
+    def _on_calibrate(self, _) -> None:
+        self.on_path = False
+        self.calib.start()
+
+    def _on_edit(self, _) -> None:
+        if self.editor is None or not plt.fignum_exists(self.editor.fig.number):
+            self.editor = CalibrationEditor(self.calib)
+        else:
+            self.editor.load()
+
     def _on_path(self, _) -> None:
         self.on_path = not self.on_path
 
     # ─── Frame ───────────────────────────────────────────────────────────────
 
     def update(self, _=None) -> None:
-        if not self.paused:
+        if self.editor is not None and plt.fignum_exists(self.editor.fig.number):
+            self.editor.refresh()                         # pick up a new calibration
+        if self.calib.busy:                               # sensors belong to the calibration
+            self.true_m.set_data([self.sim.true[0]], [self.sim.true[1]])
+            self.target_m.set_data([self.sim.true[0]], [self.sim.true[1]])
+            self.info.set_text(f"calibration  {self._calib_text()}")
+        elif not self.paused:
             self.advance()
 
     def advance(self) -> None:
@@ -200,6 +289,14 @@ class App:
 
         self.info.set_text(self._info_text(f))
 
+    def _calib_text(self) -> str:
+        c = self.calib
+        if c.busy:
+            k = c.state[-1]
+            return f"{c.state} at P{k}, {c.reads} reads"
+        return {"idle": "offsets from config.toml", "done": "done, saved to config.toml",
+                "error": f"error: {c.error}"}[c.state]
+
     def _info_text(self, f: dict) -> str:
         lines = [f"{'error (cm)':<10} {'now':>7} {'RMS':>7} {'fails':>6}"]
         for a in ALGORITHMS:
@@ -208,6 +305,7 @@ class App:
         lines += [
             "",
             f"frames     {self.sim.frames}   t = {self.sim.time:.1f} s",
+            f"calib.     {self._calib_text()}",
             f"kept       {', '.join(f'R{i}' for i in f['sane']) or 'none'}",
             f"CEP used   {', '.join(f'R{i}' for i in f['cep_subset']) or 'none, holding last fix'}",
             f"CEP4 used  {', '.join(f'R{i}' for i in f['cep4_subset']) or 'none, holding last fix'}",
@@ -222,6 +320,8 @@ class App:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--config", default=DEFAULT_CONFIG, help="config.toml with receivers + calibration")
+    p.add_argument("--sensors", default=DEFAULT_SENSORS,
+                   help="sensors.toml with the simulated hardware's true tick response")
     p.add_argument("--max-differential", type=float, default=50.0,
                    help="library jump filter, cm per frame (default 50)")
     p.add_argument("--max-distance", type=float, default=None,
@@ -229,7 +329,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=None, help="random seed for repeatable runs")
     args = p.parse_args()
 
-    app = App(Simulation(args.config, args.max_differential, args.max_distance, seed=args.seed))  # noqa: F841 (keeps the animation alive)
+    sim = Simulation(args.config, args.sensors, args.max_differential, args.max_distance, seed=args.seed)
+    app = App(sim, args.config)  # noqa: F841 (keeps the animation alive)
     plt.show()
 
 

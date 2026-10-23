@@ -1,15 +1,27 @@
 """Headless checks for the simulator:  python3 -m unittest test_simulator"""
 
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from calibration import Calibrator, read_offsets  # noqa: E402
 from sensor_model import Faults  # noqa: E402
 from simulation import Simulation  # noqa: E402
+from solvers import DEFAULT_CONFIG, DEFAULT_SENSORS  # noqa: E402
+from ultragps_position import load_config  # noqa: E402
+
+
+def temp_config() -> str:
+    """Copy of config.toml in a temp dir, so calibration tests don't edit the repo's."""
+    path = os.path.join(tempfile.mkdtemp(), "config.toml")
+    shutil.copy(DEFAULT_CONFIG, path)
+    return path
 
 
 def run(sim: Simulation, pos, frames: int = 30) -> dict:
@@ -118,6 +130,42 @@ class SimulatorTest(unittest.TestCase):
             true = sim.sensor.true_distances(frame["true"])
             ratio = np.array(frame["distances"]) / true
             self.assertTrue(np.all(np.abs(ratio - 1) <= 0.10 + 0.01))
+
+    def test_calibration_routine_recovers_sensor_response(self):
+        cfg = temp_config()
+        sim = Simulation(cfg, seed=0)
+        sim.faults = Faults(noise_cm=0.5)
+        cal = Calibrator(sim, cfg)
+        offsets = cal.run()
+        self.assertEqual(cal.state, "done")
+        self.assertEqual(set(offsets), set(range(6)))
+        saved = read_offsets(cfg)
+        for i in range(6):
+            self.assertEqual(saved[i], offsets[i])
+            self.assertEqual(sim.solvers.lib._offsets[i], offsets[i])   # applied
+            # Fitted line agrees with the true response at the calibration points
+            for d in cal.cal.get_cal_distances(i):
+                tick = (d - sim.sensor.intercepts[i]) / sim.sensor.slopes[i]
+                fitted = tick * offsets[i]["slope"] + offsets[i]["intercept"]
+                self.assertLess(abs(fitted - d), 3.0)
+
+    def test_edited_offsets_are_saved_and_used(self):
+        cfg = temp_config()
+        sim = Simulation(cfg, seed=0)
+        sim.faults = Faults(noise_cm=0.0)
+        cal = Calibrator(sim, cfg)
+        offsets = read_offsets(cfg)
+        offsets[0]["intercept"] += 40.0          # mis-calibrate R0 by 40 cm
+        cal.save(offsets)
+        self.assertEqual(read_offsets(cfg)[0]["intercept"], offsets[0]["intercept"])
+        frame = run(sim, [30, 50], frames=1)
+        true = sim.sensor.true_distances(frame["true"])
+        self.assertAlmostEqual(frame["distances"][0] - true[0], 40.0, delta=1.0)
+
+    def test_sensor_truth_comes_from_sensors_toml(self):
+        sim = Simulation(DEFAULT_CONFIG, DEFAULT_SENSORS)
+        truth = sorted(load_config(DEFAULT_SENSORS)["receivers"], key=lambda r: r["id"])
+        np.testing.assert_allclose(sim.sensor.slopes, [r["slope"] for r in truth])
 
 
 if __name__ == "__main__":

@@ -47,16 +47,19 @@ from ultragps_position import UltraGPSPositionLib, load_config
 
 _REPO = os.path.dirname(os.path.abspath(__file__))
 
-DEFAULT_CONFIG = os.path.join(_REPO, "config", "config.toml")
+DEFAULT_CONFIG  = os.path.join(_REPO, "config", "config.toml")
+DEFAULT_SENSORS = os.path.join(_REPO, "config", "sensors.toml")
 ALGORITHMS     = ("OLS", "LM", "CEP", "CEP4")
 
 
-def load_calibration(config_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ``(coords, slopes, intercepts)`` in receiver-id order."""
-    receivers = sorted(load_config(config_path)["receivers"], key=lambda r: r["id"])
+def load_sensors(config_path: str, sensors_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(coords, slopes, intercepts)`` in receiver-id order: positions
+    from config.toml, true tick response from sensors.toml."""
+    receivers  = sorted(load_config(config_path)["receivers"], key=lambda r: r["id"])
+    truth      = {int(r["id"]): r for r in load_config(sensors_path)["receivers"]}
     coords     = np.array([r["position"] for r in receivers], dtype=float)
-    slopes     = np.array([r["offset"]["slope"] for r in receivers], dtype=float)
-    intercepts = np.array([r["offset"]["intercept"] for r in receivers], dtype=float)
+    slopes     = np.array([truth[r["id"]]["slope"] for r in receivers], dtype=float)
+    intercepts = np.array([truth[r["id"]]["intercept"] for r in receivers], dtype=float)
     return coords, slopes, intercepts
 
 
