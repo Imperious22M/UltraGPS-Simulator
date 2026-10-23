@@ -4,8 +4,8 @@ simulated sensors, and reads / writes the offsets it produces.
 
 The library drives hardware through a client object whose ``pulse()`` returns
 one tick per receiver.  ``SimClient`` stands in for ``UltraGPSClient``: its
-``pulse()`` measures the simulated sensors at the calibration point the
-transmitter is parked on, with the current faults and receivers switched off.
+``pulse()`` pings the simulated hardware with the transmitter parked on the
+calibration point, with the current physics, faults and receiver states.
 
 The library collects readings at each calibration point in turn (2 to 4 of
 them, ``cal_points`` in config.toml), takes each receiver's most frequent tick
@@ -40,8 +40,7 @@ class SimClient:
         self.position = np.zeros(2)
 
     def pulse(self) -> list[int]:
-        ticks, _ = self.sim.sensor.measure(self.position, self.sim.enabled, self.sim.faults)
-        return ticks
+        return [r.tick for r in self.sim.hardware.measure(self.position, self.sim.motion.heading)]
 
 
 def read_offsets(config_path: str) -> dict[int, dict[str, float]]:
@@ -132,7 +131,7 @@ class Calibrator:
     def _park(self, point, state: str) -> None:
         """Put the transmitter on a calibration point."""
         self.client.position = np.array(point, dtype=float)
-        self.sim.true = self.sim.target = self.client.position.copy()
+        self.sim.place(self.client.position)
         self.state, self.reads = state, 0
 
     def save(self, offsets: dict[int, dict[str, float]]) -> None:

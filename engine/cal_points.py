@@ -2,7 +2,7 @@
 Calibration-point search — finds the set of 2, 3 or 4 calibration points that
 gives the most accurate per-receiver slope and intercept.
 
-    python3 cal_points.py [--max-points 4] [--margin 30] [--noise 1] [--trials 200] [--apply]
+    python3 -m engine.cal_points [--max-points 4] [--margin 30] [--noise 1] [--trials 200] [--apply]
 
 Why the choice matters
 ----------------------
@@ -32,8 +32,8 @@ Search
 Candidates are a grid over the receivers' bounding box, shrunk by ``margin``
 cm on every side, keeping only points within the HC-SR04's 400 cm of every
 receiver (otherwise a receiver can't be calibrated there).  The margin keeps
-points away from the receiver walls: the sensor model ignores the HC-SR04's
-narrow beam, and a point level with a wall of receivers is far off their axis.  2 points: every pair.  3 and 4 points: greedy from the best
+points away from the receiver walls: a point level with a wall of receivers is
+far off their beams, where readings are weak and late.  2 points: every pair.  3 and 4 points: greedy from the best
 smaller set, then exchange passes (swap one point for any candidate while that
 improves the score), then a fine-grid refinement.
 
@@ -59,9 +59,9 @@ from itertools import combinations
 
 import numpy as np
 
-from sensor_model import Faults
-from simulation import Simulation
-from solvers import DEFAULT_CONFIG, DEFAULT_SENSORS
+from engine.config import DEFAULT_CONFIG, DEFAULT_SENSORS
+from engine.hardware import Faults
+from engine.simulation import Simulation
 from ultragps_position import load_config
 
 MAX_RANGE_CM = 400.0
@@ -166,12 +166,17 @@ def arena_score(points, coords) -> float:
 
 # ─── Simulated check ─────────────────────────────────────────────────────────
 
+def true_response(sim: Simulation) -> tuple[np.ndarray, np.ndarray]:
+    """Each receiver's true (slope, intercept) from sensors.toml."""
+    return (np.array([r.slope for r in sim.receivers]), np.array([r.intercept for r in sim.receivers]))
+
+
 def simulate(points, sim: Simulation, min_reads: int, trials: int) -> dict:
     """Calibrate ``trials`` times at ``points`` on the simulated sensors.
     Returns RMS slope error (%), intercept error (cm) and resulting distance
     error over the arena (cm), across receivers and trials."""
     pts    = np.asarray(points, dtype=float)
-    a, b   = sim.sensor.slopes, sim.sensor.intercepts
+    a, b   = true_response(sim)
     R      = len(a)
     known  = np.linalg.norm(pts[:, None, :] - sim.coords[None, :, :], axis=2)   # (n, R)
     eval_d = np.linalg.norm(grid(sim.coords, 20.0)[:, None, :] - sim.coords[None, :, :], axis=2)
@@ -181,7 +186,7 @@ def simulate(points, sim: Simulation, min_reads: int, trials: int) -> dict:
         for j, p in enumerate(pts):
             hist = [dict() for _ in range(R)]
             while min(max(h.values(), default=0) for h in hist) < min_reads:
-                ticks, _ = sim.sensor.measure(p, sim.enabled, sim.faults)
+                ticks = [r.tick for r in sim.hardware.measure(p)]
                 for i, t in enumerate(ticks):
                     hist[i][t] = hist[i].get(t, 0) + 1
             modal[j] = [max(h, key=h.__getitem__) for h in hist]
@@ -197,15 +202,16 @@ def simulate(points, sim: Simulation, min_reads: int, trials: int) -> dict:
     return {"slope_pct": rms(se), "intercept_cm": rms(ie), "distance_cm": rms(de)}
 
 
-def library_check(points, config_path: str, noise: float, seed: int) -> dict:
+def library_check(points, config_path: str, noise: float, seed: int,
+                  sensors_path: str = DEFAULT_SENSORS) -> dict:
     """Run the calibration library once at a point set; return errors."""
-    from calibration import Calibrator, set_cal_points
+    from engine.calibration import Calibrator, set_cal_points
     tmp = os.path.join(tempfile.mkdtemp(), "config.toml")
     set_cal_points(config_path, points, tmp)
-    sim = Simulation(tmp, seed=seed)
+    sim = Simulation(tmp, sensors_path, seed=seed)
     sim.faults = Faults(noise_cm=noise)
     off = Calibrator(sim, tmp).run()
-    a, b = sim.sensor.slopes, sim.sensor.intercepts
+    a, b = true_response(sim)
     return {i: ((o["slope"] - a[i]) / a[i] * 100, o["intercept"] - b[i]) for i, o in off.items()}
 
 
@@ -223,7 +229,7 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--apply", action="store_true",
                    help="write the best --max-points set into --config")
-    p.add_argument("--plot", default="cal_points.png", help="save a plot here ('' to skip)")
+    p.add_argument("--plot", default="", help="save a plot here (needs matplotlib)")
     args = p.parse_args()
 
     sim = Simulation(args.config, args.sensors, seed=args.seed)
@@ -254,12 +260,12 @@ def main() -> None:
                                         for i, ((s, c), (cs, cc)) in enumerate(zip(e, cur))))
 
     best = f"best {args.max_points}"
-    lib = library_check(sets[best], args.config, args.noise, args.seed)
+    lib = library_check(sets[best], args.config, args.noise, args.seed, args.sensors)
     print(f"\n{best} through the calibration library (one run): "
           + "  ".join(f"R{i} {s:+.1f}%/{c:+.1f}cm" for i, (s, c) in lib.items()))
 
     if args.apply:
-        from calibration import set_cal_points
+        from engine.calibration import set_cal_points
         set_cal_points(args.config, sets[best])
         print(f"\nWrote the {best} set to {args.config}")
 

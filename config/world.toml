@@ -1,0 +1,12 @@
+# The room the simulated sound travels in (centimetres, same axes as config.toml).
+#
+# walls: one closed polygon round the arena; remove it for an open field.
+# reflectivity: share of the sound's amplitude a surface reflects (0..1);
+# hard walls about 0.6-0.9, cloth or foam much less.
+# obstacles: convex polygons that block and reflect sound.
+#
+# These walls are a guess (50 cm outside the receivers): measure your room and
+# edit them, or draw obstacles in the simulator and use File > Save world.
+
+wall_reflectivity = 0.60
+walls = [[-177.0, -236.9], [177.0, -236.9], [177.0, 236.9], [-177.0, 236.9]]
