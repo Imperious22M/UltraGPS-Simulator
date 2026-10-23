@@ -47,12 +47,12 @@ TOOL_HINTS = {"move": "Click to send the transmitter there",
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, sim, config_path: str):
+    def __init__(self, sim, config_path: str, restore: bool = True):
         super().__init__()
         self.sim         = sim
         self.config_path = config_path
         self.runner      = SimRunner(sim, self)
-        self.calibrator  = Calibrator(sim, config_path)
+        self.calibrator  = Calibrator(sim, config_path, self.runner.lock)
         self.runner.hold = lambda: self.calibrator.busy
         self.lab = self.calib_win = self.map_win = self.manual = None
         self._picks: list | None = None
@@ -74,7 +74,8 @@ class MainWindow(QMainWindow):
         self._connect()
 
         self._default_state = self.saveState()
-        self._restore_layout()
+        if restore:
+            self._restore_layout()
         self.runner.frameReady.connect(self.on_frame)
 
     # ─── Layout ──────────────────────────────────────────────────────────────
@@ -105,7 +106,7 @@ class MainWindow(QMainWindow):
         self.d_receivers = self._dock("Receivers", "receivers", self.receivers, L)
         self.d_algos     = self._dock("Algorithms", "algorithms", self.algos, R)
         self.d_env       = self._dock("Environment", "environment", self.envpanel, R)
-        self.d_faults    = self._dock("Faults & filter", "faults", self.faults, R)
+        self.d_faults    = self._dock("Faults && filter", "faults", self.faults, R)
         self.d_scope     = self._dock("Echo scope", "scope", self.scope, B)
         self.d_chart     = self._dock("Error", "error", self.chart, B)
         self.tabifyDockWidget(self.d_env, self.d_faults)
@@ -113,6 +114,7 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self.d_scope, self.d_chart, Qt.Orientation.Horizontal)
         self.resizeDocks([self.d_scenario, self.d_algos], [330, 360], Qt.Orientation.Horizontal)
         self.resizeDocks([self.d_scope], [250], Qt.Orientation.Vertical)
+        self.resizeDocks([self.d_scenario, self.d_receivers], [300, 330], Qt.Orientation.Vertical)
 
     def _action(self, text: str, slot=None, shortcut=None, tip: str = "", checkable: bool = False,
                 checked: bool = False) -> QAction:

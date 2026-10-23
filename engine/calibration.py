@@ -23,6 +23,7 @@ points (and every receiver's ``cal_distances``) in config.toml.
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -35,12 +36,14 @@ class SimClient:
     """Minimal stand-in for ``UltraGPSClient``: the calibration library only
     calls ``pulse()``."""
 
-    def __init__(self, sim):
+    def __init__(self, sim, lock=None):
         self.sim      = sim
+        self.lock     = lock or nullcontext()
         self.position = np.zeros(2)
 
     def pulse(self) -> list[int]:
-        return [r.tick for r in self.sim.hardware.measure(self.position, self.sim.motion.heading)]
+        with self.lock:
+            return [r.tick for r in self.sim.hardware.measure(self.position, self.sim.motion.heading)]
 
 
 def read_offsets(config_path: str) -> dict[int, dict[str, float]]:
@@ -71,13 +74,16 @@ class Calibrator:
     """One simulated two-point calibration, run in the background.
 
     ``state`` is ``idle``, ``run 1``, ``run 2``, ``done`` or ``error``;
-    ``reads`` is the number of pulses collected in the current run.
+    ``reads`` is the number of pulses collected in the current run.  ``lock``
+    is the simulation runner's lock: the calibration runs on its own thread and
+    must not move the transmitter or swap the library in the middle of a frame.
     """
 
-    def __init__(self, sim, config_path: str):
+    def __init__(self, sim, config_path: str, lock=None):
         self.sim         = sim
         self.config_path = config_path
-        self.client      = SimClient(sim)
+        self.lock        = lock or nullcontext()
+        self.client      = SimClient(sim, lock)
         self.cal         = UltraGPSCalibration(config_path, self.client)
         self.state       = "idle"
         self.reads       = 0
@@ -121,7 +127,8 @@ class Calibrator:
                 on_between_runs=between,
                 on_reading=lambda run, n: setattr(self, "reads", n),
             )
-            self.sim.reload_calibration()
+            with self.lock:
+                self.sim.reload_calibration()
             self.version += 1
             self.state = "done"
         except Exception as exc:   # surface it in the GUI rather than kill the thread
@@ -131,7 +138,8 @@ class Calibrator:
     def _park(self, point, state: str) -> None:
         """Put the transmitter on a calibration point."""
         self.client.position = np.array(point, dtype=float)
-        self.sim.place(self.client.position)
+        with self.lock:
+            self.sim.place(self.client.position)
         self.state, self.reads = state, 0
 
     def save(self, offsets: dict[int, dict[str, float]]) -> None:
@@ -139,5 +147,6 @@ class Calibrator:
         if self.busy:
             raise RuntimeError("calibration is running")
         self.cal.save_offsets(offsets)
-        self.sim.reload_calibration()
+        with self.lock:
+            self.sim.reload_calibration()
         self.version += 1

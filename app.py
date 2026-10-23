@@ -51,14 +51,13 @@ def main() -> None:
     from gui.main_window import MainWindow   # after the palette, so widgets pick it up
     sim = Simulation(args.config, args.sensors, args.world, args.max_differential, args.max_distance,
                      seed=args.seed, env=Environment(**PRESETS[args.preset]))
-    win = MainWindow(sim, args.config)
+    win = MainWindow(sim, args.config, restore=not args.screenshot)
     if args.palette:
         win.set_palette(args.palette)
 
     if args.screenshot:
         w, h = (int(v) for v in args.size.lower().split("x"))
         win.resize(w, h)
-        win.reset_layout()
         win.show()
         sim.motion.set_mode(args.motion)
         win.runner.paused = True

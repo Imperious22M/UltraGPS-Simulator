@@ -112,12 +112,14 @@ class ErrorChart(QWidget):
     def _visible(self):
         """What the time axis shows: ``(t, {algorithm: errors}, t0, span)``, the
         latest frame at the right edge.  The axis spans ``window_s``, or less
-        when the simulation keeps a shorter history (small timesteps)."""
+        when the simulation keeps a shorter history (small timesteps) or has
+        run for less time than that."""
         t = self._t
         if not len(t):
             return t, {}, 0.0, self.window_s
         dt   = float(t[-1] - t[-2]) if len(t) > 1 else 0.0
         span = min(self.window_s, self._capacity * dt) if self._capacity and dt > 0 else self.window_s
+        span = min(span, max(float(t[-1] - t[0]) + dt, 5.0))   # a short run fills the plot, not a corner
         t0   = float(t[-1]) - span
         keep = t >= t0 - 1e-9
         return t[keep], {k: v[keep] for k, v in self._series.items()}, t0, span

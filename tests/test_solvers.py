@@ -11,6 +11,7 @@ from engine import lab
 from engine import solvers as S
 from engine.config import DEFAULT_CONFIG
 from engine.hardware import Faults
+from engine.motion import Motion
 from ultragps_position import UltraGPSPositionLib
 
 
@@ -48,6 +49,16 @@ class SolverTest(unittest.TestCase):
         est = S.solve_bias(lib, d + 12.0, list(range(6)))
         np.testing.assert_allclose(est.pos, [30.0, 50.0], atol=1e-3)
         self.assertIn("+12.0", est.note)
+
+    def test_bias_solver_refuses_an_implausible_offset(self):
+        lib, d = lib_and_ranges()
+        d[[0, 3]] += 250.0                       # two echoes: "explained" by a huge offset
+        est = S.solve_bias(lib, d, list(range(6)))
+        if est.ok:
+            self.assertLess(abs(float(est.note.split()[1])), S.MAX_OFFSET_CM)
+        d2 = d.copy()
+        d2[:] = 1e6                              # nonsense in every range
+        self.assertFalse(S.solve_bias(lib, d2, list(range(6))).ok)
 
     def test_bias_solver_beats_lm_under_trigger_jitter(self):
         sim = ideal_sim(noise=0.5, sync_jitter_us=150.0)
@@ -99,6 +110,15 @@ class LabTest(unittest.TestCase):
         s = tr.steps[5]
         np.testing.assert_allclose(s.weights, 1 / (np.abs(s.residuals) + 0.1))
         self.assertFalse(hasattr(lib, "__dict__") and "_compute_cep" in lib.__dict__)   # unwrapped again
+
+    def test_cep_trace_never_calls_an_unusable_subset_best(self):
+        lib, d = lib_and_ranges()
+        trace = lab.trace_cep(lib, d, list(range(6)))
+        for k, step in enumerate(trace.steps):
+            if step.best:
+                self.assertTrue(np.isfinite(step.cep))
+                self.assertTrue(all(step.cep < s.cep for s in trace.steps[:k]))
+        self.assertTrue(trace.steps[trace.best].best)
 
     def test_lm_trace_ends_where_the_library_does(self):
         lib, d = lib_and_ranges()
@@ -160,6 +180,18 @@ class RecordingTest(unittest.TestCase):
             self.assertEqual([f.ticks for f in replayed], [f.ticks for f in frames])
             self.assertEqual(replayed[0].true is not None, truth)
         sim.stop_replay()
+
+
+class MotionTest(unittest.TestCase):
+    def test_circle_mode_catches_its_path_and_stays_on_it(self):
+        m = Motion((-100.0, -100.0, 100.0, 100.0))
+        m.set_mode("circle")
+        pos = np.array([0.0, 0.0])
+        for _ in range(60):
+            pos = m.step(pos, 0.1)
+        for _ in range(40):
+            pos = m.step(pos, 0.1)
+            self.assertAlmostEqual(float(np.hypot(*pos)), m.radius, delta=1e-6)
 
 
 if __name__ == "__main__":

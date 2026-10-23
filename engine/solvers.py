@@ -187,6 +187,9 @@ def solve_robust(lib, d, idx, scale: float) -> Estimate:
                     "down-weighted " + ", ".join(out) if out else "all consistent")
 
 
+MAX_OFFSET_CM = 100.0     # a common range offset larger than this means the ranges disagree, not a timing error
+
+
 def solve_bias(lib, d, idx) -> Estimate:
     if len(idx) < 4:
         return Estimate(None, False, note="needs 4 receivers")
@@ -195,6 +198,10 @@ def solve_bias(lib, d, idx) -> Estimate:
     dd     = d[idx]
     x0     = np.r_[lib._ols(d, np.array(idx)), 0.0]
     r      = least_squares(lambda v: np.linalg.norm(coords - v[:2], axis=1) + v[2] - dd, x0, method="lm")
+    if not np.all(np.isfinite(r.x)) or abs(r.x[2]) > MAX_OFFSET_CM:
+        # Ranges that disagree badly (an echo, a blocked path) can be "explained"
+        # by a huge common offset and a position far away: not a fix.
+        return Estimate(None, False, idx, note=f"offset {r.x[2]:+.0f} cm: not plausible")
     cov    = covariance(coords, r.x[:2], r.fun) if len(idx) > 4 else None
     return Estimate(r.x[:2], bool(r.success), idx, cov, f"offset {r.x[2]:+.1f} cm")
 

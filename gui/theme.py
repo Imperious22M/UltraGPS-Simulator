@@ -125,6 +125,8 @@ def stylesheet(p: Palette) -> str:
     QPushButton:disabled {{ color: {p.text_muted}; }}
     QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{ background: {p.panel_alt}; border: 1px solid {p.border};
         border-radius: 3px; padding: 2px 4px; selection-background-color: {p.accent}; }}
+    QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled, QLabel:disabled,
+    QCheckBox:disabled, QRadioButton:disabled, QToolButton:disabled {{ color: {p.text_muted}; }}
     QComboBox QAbstractItemView {{ background: {p.panel_alt}; border: 1px solid {p.border}; }}
     QGroupBox {{ border: 1px solid {p.border}; border-radius: 4px; margin-top: 14px; padding-top: 6px; }}
     QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; color: {p.text_dim}; }}
@@ -132,6 +134,8 @@ def stylesheet(p: Palette) -> str:
     QSlider::sub-page:horizontal {{ background: {p.accent}; height: 2px; }}
     QSlider::handle:horizontal {{ background: {p.panel}; border: 1px solid {p.accent}; width: 10px;
         height: 10px; margin: -5px 0; border-radius: 5px; }}
+    QSlider::sub-page:horizontal:disabled {{ background: {p.text_muted}; }}
+    QSlider::handle:horizontal:disabled {{ border-color: {p.text_muted}; }}
     QCheckBox::indicator, QRadioButton::indicator {{ width: 12px; height: 12px; border: 1px solid {p.text_dim};
         background: {p.panel}; }}
     QRadioButton::indicator {{ border-radius: 6px; }}

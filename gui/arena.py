@@ -80,7 +80,7 @@ _VIRIDIS = np.array([[int(c[i:i + 2], 16) for i in (1, 3, 5)] for c in (
 
 
 def viridis(values, vmin: float, vmax: float) -> np.ndarray:
-    """ARGB32 pixels (uint32) of ``values`` on the viridis scale; nan is transparent."""
+    """ARGB32 pixels (uint32) of ``values`` on the viridis scale; nan and inf are transparent."""
     values = np.asarray(values, dtype=float)
     t      = np.nan_to_num(np.clip((values - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0))
     knots  = np.linspace(0.0, 1.0, len(_VIRIDIS))
@@ -316,6 +316,7 @@ class ArenaView(QWidget):
         if vmax is None:
             vmax = float(finite.max()) if finite.size else 1.0
         vmax      = max(vmax, vmin + 1e-9)
+        Z         = np.where(np.isposinf(Z), vmax, Z)     # no fix at all: the worst colour, not a hole
         hx        = (xs[-1] - xs[0]) / max(len(xs) - 1, 1) / 2
         hy        = (ys[-1] - ys[0]) / max(len(ys) - 1, 1) / 2
         levels    = np.linspace(vmin, vmax, 6)[1:-1]

@@ -123,7 +123,7 @@ def trace_cep(lib: UltraGPSPositionLib, distances, sane: list, max_subsets: int 
         fits.clear()
         pos, cep, cov = orig(dist, idx)
         seed, res = fits[-1]
-        best = all(cep < s.cep for s in steps)
+        best = cep < min((s.cep for s in steps), default=float("inf"))   # the library's own test
         steps.append(SubsetStep(list(idx), seed, np.array(pos, dtype=float), np.array(res.fun),
                                 1.0 / (np.abs(res.fun) + 0.1), np.array(cov), float(cep), best))
         return pos, cep, cov
@@ -186,7 +186,7 @@ def trace_lm(lib: UltraGPSPositionLib, distances, indices, initial=None) -> LMTr
             cur, cur_cost = x, cost
             points.append((x, cost, "start"))
             path.append(x)
-        elif np.hypot(*(x - cur)) < 1e-5 * (1.0 + np.hypot(*cur)):
+        elif np.hypot(*(x - cur)) < 1e-6 * (1.0 + np.hypot(*cur)):    # a finite-difference probe
             points.append((x, cost, "jacobian"))
         elif cost <= cur_cost:
             cur, cur_cost = x, cost

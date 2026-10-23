@@ -76,10 +76,13 @@ class Motion:
                 x0, y0, x1, y1 = self.bounds
                 self.target = np.array([self.rng.uniform(x0, x1), self.rng.uniform(y0, y1)])
 
+        # On a moving path point the transmitter may go twice as fast until it
+        # catches up; at the same speed it would chase the point for ever.
+        reach = 2 * move if self.mode in ("circle", "figure8") else move
         delta = self.target - pos
         dist  = float(np.hypot(*delta))
         if dist > 1e-9:
             self.heading = math.degrees(math.atan2(delta[1], delta[0]))
-        if dist <= move:
+        if dist <= reach:
             return self.target.copy()
-        return pos + delta / dist * move
+        return pos + delta / dist * reach

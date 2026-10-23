@@ -1,3 +1,5 @@
-matplotlib
+PyQt6>=6.5
 numpy
 scipy
+# optional: only engine/cal_points.py --plot draws with it
+# matplotlib

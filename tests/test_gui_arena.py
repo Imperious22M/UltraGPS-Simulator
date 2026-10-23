@@ -409,5 +409,16 @@ class ArenaEditingTest(unittest.TestCase):
         self.assertEqual(moved, [self.arena.view.world(123, 234)])
 
 
+class HatchTest(unittest.TestCase):
+    def test_hatch_lines_are_cut_to_the_outline(self):
+        from gui.draw import _inside_pieces
+        square = [QPointF(0, 0), QPointF(10, 0), QPointF(10, 10), QPointF(0, 10)]
+        self.assertEqual(_inside_pieces(QPointF(-5, 5), QPointF(15, 5), square), [(0.25, 0.75)])
+        notch = [QPointF(0, 0), QPointF(10, 0), QPointF(10, 10), QPointF(6, 10), QPointF(6, 4),
+                 QPointF(4, 4), QPointF(4, 10), QPointF(0, 10)]
+        pieces = _inside_pieces(QPointF(-5, 7), QPointF(15, 7), notch)
+        self.assertEqual([(round(a, 3), round(b, 3)) for a, b in pieces], [(0.25, 0.45), (0.55, 0.75)])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -294,23 +294,43 @@ def scale_bar(p: QPainter, view: View, at: QPointF) -> None:
     label(p, QPointF(at.x() + w / 2, at.y() - 10), f"{length} cm", pal.text_dim, 7.5, "center", halo=False)
 
 
+def _inside_pieces(a: QPointF, b: QPointF, poly: list) -> list:
+    """The parts of the line a-b that lie inside the polygon (even-odd rule),
+    as parameter pairs along a-b.  ``a`` and ``b`` must lie outside it."""
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    ts = []
+    for p0, p1 in zip(poly, poly[1:] + poly[:1]):
+        ex, ey = p1.x() - p0.x(), p1.y() - p0.y()
+        den    = dx * ey - dy * ex
+        if abs(den) < 1e-12:
+            continue
+        wx, wy = p0.x() - a.x(), p0.y() - a.y()
+        u = (wx * dy - wy * dx) / den
+        if 0.0 <= u < 1.0:
+            ts.append((wx * ey - wy * ex) / den)
+    ts.sort()
+    return list(zip(ts[0::2], ts[1::2]))
+
+
 def hatched_polygon(p: QPainter, view: View, pts, c: str, spacing_px: float = 7.0,
                     width: float = 1.2, alpha: float = 1.0) -> None:
-    """Outlined polygon filled with diagonal hatching, like a technical drawing."""
-    poly = QPolygonF([view.px(x, y) for x, y in pts])
-    path = QPainterPath()
-    path.addPolygon(poly)
+    """Outlined polygon filled with diagonal hatching, like a technical drawing.
+
+    The hatch lines are cut to the outline here rather than with a clip path,
+    so an exported SVG shows them the same in every viewer."""
+    corners = [view.px(x, y) for x, y in pts]
+    path    = QPainterPath()
+    path.addPolygon(QPolygonF(corners))
     path.closeSubpath()
-    p.save()
-    p.setClipPath(path)
-    r = poly.boundingRect()
+    r = path.boundingRect().adjusted(-1, -1, 1, 1)
     p.setPen(pen(c, 0.8, alpha * 0.45))
-    d = r.width() + r.height()
     k = -r.height()
     while k < r.width():
-        p.drawLine(QPointF(r.left() + k, r.bottom()), QPointF(r.left() + k + r.height(), r.top()))
+        a = QPointF(r.left() + k, r.bottom())
+        b = QPointF(r.left() + k + r.height(), r.top())
+        for t0, t1 in _inside_pieces(a, b, corners):
+            p.drawLine(a + (b - a) * t0, a + (b - a) * t1)
         k += spacing_px
-    p.restore()
     stroke(p, path, c, width, alpha)
 
 
