@@ -12,6 +12,7 @@ from engine import solvers as S
 from engine.config import DEFAULT_CONFIG
 from engine.hardware import Faults
 from engine.motion import Motion
+from engine.world import Obstacle
 from ultragps_position import UltraGPSPositionLib
 
 
@@ -192,6 +193,21 @@ class MotionTest(unittest.TestCase):
         for _ in range(40):
             pos = m.step(pos, 0.1)
             self.assertAlmostEqual(float(np.hypot(*pos)), m.radius, delta=1e-6)
+
+    def test_transmitter_does_not_drive_through_obstacles(self):
+        sim = ideal_sim()
+        box = Obstacle.rect(-40, -40, 40, 40)
+        sim.world.obstacles = [box]
+        sim.place((-100, 0))
+        sim.motion.go_to((100, 0))                 # straight through the box
+        for _ in range(60):
+            sim.step()
+            self.assertFalse(box.contains(sim.true))
+        self.assertLess(sim.true[0], -39)            # stopped at its edge
+        sim.motion.set_mode("random")
+        for _ in range(200):
+            sim.step()
+            self.assertFalse(box.contains(sim.true))
 
 
 if __name__ == "__main__":

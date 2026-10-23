@@ -177,7 +177,8 @@ def apply(app, name: str = "vector") -> Palette:
                     (QPalette.ColorRole.WindowText, p.text), (QPalette.ColorRole.Button, p.panel_alt),
                     (QPalette.ColorRole.ButtonText, p.text), (QPalette.ColorRole.Highlight, p.accent),
                     (QPalette.ColorRole.HighlightedText, p.bg), (QPalette.ColorRole.ToolTipBase, p.panel_alt),
-                    (QPalette.ColorRole.ToolTipText, p.text), (QPalette.ColorRole.PlaceholderText, p.text_muted)):
+                    (QPalette.ColorRole.ToolTipText, p.text), (QPalette.ColorRole.PlaceholderText, p.text_muted),
+                    (QPalette.ColorRole.Link, p.accent), (QPalette.ColorRole.LinkVisited, p.accent)):
         pal.setColor(role, QColor(c))
     app.setPalette(pal)
     app.setFont(ui_font())

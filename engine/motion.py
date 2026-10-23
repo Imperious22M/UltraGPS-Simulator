@@ -36,6 +36,12 @@ class Motion:
         self.mode   = "target"
         self.target = np.asarray(xy, dtype=float)
 
+    def blocked(self) -> None:
+        """The way ahead runs into an obstacle.  The transmitter stays where it
+        is; a waypoint mode picks its next waypoint instead."""
+        if self.mode in ("lawnmower", "random"):
+            self.phase = 0.0
+
     def _path_point(self, s: float) -> np.ndarray:
         x0, y0, x1, y1 = self.bounds
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2

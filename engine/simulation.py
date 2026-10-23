@@ -188,7 +188,11 @@ class Simulation:
             if true is not None:
                 self.true = true
         else:
-            self.true = self.motion.step(self.true, dt)
+            ahead = self.motion.step(self.true, dt)
+            if any(o.contains(ahead) for o in self.world.obstacles):
+                self.motion.blocked()          # it can't drive through an obstacle: stop at it
+            else:
+                self.true = ahead
             true      = self.true.copy()
             readings  = self.hardware.measure(true, self.motion.heading)
             ticks     = [r.tick for r in readings]

@@ -10,8 +10,9 @@ from __future__ import annotations
 import os
 import time
 
-from PyQt6.QtCore import QByteArray, QSettings, Qt
-from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
+from PyQt6.QtCore import QByteArray, QSettings, Qt, QUrl
+from PyQt6.QtGui import (QAction, QActionGroup, QImage, QKeySequence, QPixmap, QTextCharFormat, QTextCursor,
+                         QTextDocument)
 from PyQt6.QtWidgets import (QApplication, QDockWidget, QFileDialog, QLabel, QMainWindow,
                              QMessageBox, QTextBrowser, QToolBar, QWidget)
 
@@ -482,16 +483,7 @@ class MainWindow(QMainWindow):
 
     def open_manual(self) -> None:
         if self.manual is None:
-            self.manual = QTextBrowser()
-            self.manual.setWindowTitle("UltraGPS simulator manual")
-            self.manual.setOpenExternalLinks(True)
-            self.manual.setSearchPaths([REPO])
-            self.manual.resize(900, 800)
-            if os.path.exists(MANUAL):
-                with open(MANUAL, encoding="utf-8") as fh:
-                    self.manual.setMarkdown(fh.read())
-            else:
-                self.manual.setPlainText("MANUAL.md not found.")
+            self.manual = ManualView()
         self._show(self.manual)
 
     def show_shortcuts(self) -> None:
@@ -517,3 +509,62 @@ class MainWindow(QMainWindow):
             if w is not None:
                 w.close()
         super().closeEvent(event)
+
+
+class ManualView(QTextBrowser):
+    """MANUAL.md as the user reads it on GitHub: headings are link targets for
+    the contents, and the pictures shrink to the window's width."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("UltraGPS simulator manual")
+        self.setOpenExternalLinks(True)
+        self.setSearchPaths([REPO])
+        self.resize(900, 800)
+        if not os.path.exists(MANUAL):
+            self.setPlainText("MANUAL.md not found.")
+            return
+        with open(MANUAL, encoding="utf-8") as fh:
+            self.setMarkdown(fh.read())
+        doc, block = self.document(), self.document().begin()
+        while block.isValid():
+            if block.blockFormat().headingLevel():
+                cur = QTextCursor(block)
+                cur.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                fmt = QTextCharFormat()
+                fmt.setAnchor(True)
+                fmt.setAnchorNames([_slug(block.text())])
+                cur.mergeCharFormat(fmt)
+            block = block.next()
+        self._fit_images()
+
+    def _fit_images(self) -> None:
+        width = max(self.viewport().width() - 30, 200)
+        doc   = self.document()
+        block = doc.begin()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and frag.charFormat().isImageFormat():
+                    fmt   = frag.charFormat().toImageFormat()
+                    image = doc.resource(QTextDocument.ResourceType.ImageResource, QUrl(fmt.name()))
+                    if isinstance(image, (QImage, QPixmap)) and image.width():
+                        fmt.setWidth(min(width, image.width()))
+                        fmt.setHeight(min(width, image.width()) * image.height() / image.width())
+                        cur = QTextCursor(doc)
+                        cur.setPosition(frag.position())
+                        cur.setPosition(frag.position() + frag.length(), QTextCursor.MoveMode.KeepAnchor)
+                        cur.setCharFormat(fmt)
+                it += 1
+            block = block.next()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_images()
+
+
+def _slug(heading: str) -> str:
+    """GitHub's anchor for a heading: "3.1 The arena" -> "31-the-arena"."""
+    text = "".join(ch for ch in heading.lower() if ch.isalnum() or ch in " -_")
+    return text.replace(" ", "-")
