@@ -163,7 +163,7 @@ bar.
 |---|---|
 | **Scenario** | Motion (click to go, circle, figure eight, lawnmower, random waypoints), speed, path radius, timestep (0.1 s is the base station's 10 Hz), time scale, and a readout of the transmitter and the frame rate |
 | **Receivers** | One row per receiver: on, blocked or off; what its sensor did this ping in words; the tick it reported, the distance the library makes of it (values of 10 000 cm or more shortened, e.g. 12k), the true distance and the error; **K** if the library's filter kept it and **C** if it is in the CEP's best subset; the detected sound's strength over the threshold in dB. Under it, **Survey error σ** moves the real receivers away from where config.toml says they are, and **Re-roll** draws a new error |
-| **Algorithms** | One row per algorithm: show it or not; its error now, RMS and 95th percentile over the last 300 frames, and failed frames; under it, its name and a note (the CEP value for CEP and CEP4, LM's rms, BIAS's offset, RANSAC's agreement, or why there is no fix); the receivers in CEP's subset are the C marks in Receivers. Under it, the solver settings (section 5), starting with **CEP subsets**, and **Reset stats** |
+| **Algorithms** | One row per algorithm: show it or not; its error now, RMS and 95th percentile over the last 300 frames, and failed frames; under it, its name and a note (the CEP value for CEP and CEP4, LM's rms, BIAS's offset, RANSAC's agreement, ROBUST's down-weighted receivers, the EKF's ranges used or gated, or why there is no fix); the receivers in CEP's subset are the C marks in Receivers. Under it, the solver settings (section 5), starting with **CEP subsets**, and **Reset stats** |
 | **Environment** | A preset, the speed of sound and absorption they make, then every physical effect of section 4.1 in five groups: Air, Transducers, Detection, Propagation, and Timing & electronics. Every control has a tooltip saying what it does; controls that only matter with another one on are greyed out without it |
 | **Faults and filter** | Injected faults (range noise, dropouts, lost signal, bad values and how bad), and the library's own filter: top-band reject and jump filter |
 | **Echo scope** | One row per receiver, like a logic analyser (below) |
@@ -299,7 +299,7 @@ firmware does it (`UltraGPS-Arduino/base-station/src/main.cpp`):
 
 | Effect | Model | Control | What you see | Why it matters on the real system |
 |---|---|---|---|---|
-| Speed of sound | (331.3 + 0.606·T) m/s for dry air, corrected for the water vapour's lighter molecules and heat capacity (vapour fraction from ISO 9613-1): 344.05 m/s at 20 °C and 50 %; dry to saturated adds 1.3 m/s at 20 °C, 2.4 at 30 °C, 5.6 at 45 °C | Air temperature, humidity; calibration temperature and humidity | Every range scales by c_cal / c | At 50 % humidity, 10 °C warmer than at calibration = 1.9 % short (5.6 cm at 3 m); 10 °C colder = 1.9 % long |
+| Speed of sound | (331.3 + 0.606·T) m/s for dry air, corrected for the water vapour's lighter molecules and heat capacity (vapour fraction from ISO 9613-1): 344.05 m/s at 20 °C and 50 %; dry to saturated adds 1.3 m/s at 20 °C, 2.4 at 30 °C, 5.6 at 45 °C | Temperature, Humidity, Calibrated at, Calibrated humidity | Every range scales by c_cal / c | At 50 % humidity, 10 °C warmer than at calibration = 1.9 % short (5.6 cm at 3 m); 10 °C colder = 1.9 % long |
 | Absorption | ISO 9613-1 at 40 kHz (about 1.3 dB/m in a room) | Temperature, humidity | Far receivers get weaker, so detect later | Ultrasound fades about 280 times faster than 1 kHz sound; humidity matters |
 | Spreading | 1/r amplitude | — | Strength falls 6 dB per doubling of distance | Sets the useful range |
 | Beam patterns | Circular piston, −6 dB at ±27.5° (400ST/SR160-type transducers), nulls filled in, falling smoothly from 90° off axis to −30 dB behind (120° and beyond) | Beam patterns on/off, RX half-angle, TX beam (All round, Along its heading, Fixed direction), TX half-angle, TX facing | Off-axis receivers detect later, then not at all; lobes drawn on the arena | Which receivers can hear which parts of the arena depends on how they are aimed |
@@ -313,7 +313,7 @@ firmware does it (`UltraGPS-Arduino/base-station/src/main.cpp`):
 | Wind | Each leg's speed c + w·û | Air flow, flow direction | Ranges upwind long, downwind short | A fan or air conditioning skews positions |
 | Trigger timing | Common offset and jitter | Trigger offset, trigger jitter | All ranges shift together | A common error that the BIAS solver removes |
 | Radio loss | Transmitter never fires | Radio loss | Every receiver times out: status `radio` | One lost frame; the solvers must hold |
-| Timeout vs window | 38 ms timeout inside an 80 ms window → high value; a clone with a 200 ms timeout → 0; the limits apply to every reading, so a detection after the timeout reads lost and one after the window 0 | Timeout, window | `lost` (high) or `missed` (0) | Explains whether a dead reading shows as 0 or as a huge distance |
+| Timeout vs window | 38 ms timeout inside an 80 ms window → high value; a clone with a 200 ms timeout → 0; the limits apply to every reading, so a detection after the timeout reads lost and one after the window 0 | Module timeout, Sampling window | `lost` (high) or `missed` (0) | Explains whether a dead reading shows as 0 or as a huge distance |
 | Listen delay | Arrivals before `rx_ready_ms` are missed | RX ready, TX delay | Close to a receiver, the direct sound can arrive before it listens | A blind zone if the transmitter fires too early |
 | Crosstalk | Receivers' own bursts are heard by the others (directly, bent round obstacles or, with Reflections on, by echoes), and each receiver hears its own burst's echo off the walls and obstacles, even with Reflections off | Crosstalk | Status `crosstalk`: reads short | If the receivers' transmit transducers are not covered, a facing receiver's burst arrives before the transmitter's and is caught first |
 | Survey error | True receiver positions differ from config.toml | Survey error σ, dragging receivers | Ghost receivers on the arena | Tape-measure errors in tower positions become position errors |
@@ -377,9 +377,12 @@ filter. Like the library's solvers, the simulator algorithms hold their last
 good fix when they cannot solve (shown hollow on the arena and counted as a
 failure). The note says why: *needs 3 receivers*, *needs 4 receivers* (CEP4,
 BIAS), *no 3 receivers agree* (RANSAC), *offset … cm: not plausible* (BIAS) or
-*waiting for 3 receivers* (EKF), with *: holding last fix* added when an
-earlier fix is held. CEP's are *outside the box: holding last fix* or, with no
-earlier fix to hold, *outside the box: rejected (no earlier fix to hold)*.
+*waiting for 3 receivers* (EKF, before it starts), with *: holding last fix*
+added when an earlier fix is held. The EKF instead shows its prediction
+(hollow, counted as a failure) on a frame where it used no range, with the
+note *coasting*, or *gated R…* when it rejected them all. CEP's are *outside
+the box: holding last fix* or, with no earlier fix to hold, *outside the box:
+rejected (no earlier fix to hold)*.
 
 **Solver settings** in the Algorithms dock:
 
@@ -628,11 +631,11 @@ average out range walk, which differs from point to point.
 **Tools > Maps** (Ctrl+M) computes one number for every point of a grid over
 the receivers' box and 30 cm round it, so you can see at a glance where the
 system works and why. A map is computed in a separate process from a copy of
-the simulation, so the simulation keeps running at full speed; while it
-computes, and after it fails or is cancelled (**Cancel** stops it within one
-ping), the previous map stays on screen dimmed. Hover for the value under the
-cursor, and **Show on arena** shades the main arena with it, contour lines
-included.
+the simulation, so the simulation keeps running (a little slower) and the map
+takes about as long as with the simulation paused; while it computes, and
+after it fails or is cancelled (**Cancel** stops it within one ping), the
+previous map stays on screen dimmed. Hover for the value under the cursor, and
+**Show on arena** shades the main arena with it, contour lines included.
 
 | Map | Value at each point | Use it to |
 |---|---|---|
@@ -644,12 +647,13 @@ included.
 
 The first four switch the random parts off (ambient noise included), so they
 show the physics alone; in the default room they take about 1.5 s (coverage
-and HDOP) and 4 s (first arrival and range bias), half a second of it to start
-the process. With the simulation running they take about the same (2 s and
-5 s here) and the simulation keeps its pace. The accuracy map for
-the library's CEP follows the **CEP subsets** setting, and since the library
-rejects any CEP fix outside the receivers' box, the margin round the box
-shows as no fix; the header gives the no-fix share inside the box
+and HDOP) and 4.5 s (first arrival and range bias), half a second of it to
+start the process. With the simulation running they take about 2 s and 5 s,
+and the simulation slows by about a sixth meanwhile (here from 7 to 6 frames a
+second); on a thread beside it they took up to ten times as long. The accuracy
+map for the library's CEP follows the **CEP subsets** setting, and since the
+library rejects any CEP fix outside the receivers' box, the margin round the
+box shows as no fix; the header gives the no-fix share inside the box
 separately.
 
 ![Multipath map](docs/img/maps-multipath.png)
@@ -843,7 +847,7 @@ about it.
 12. **Keep the transmitter's path off the walls.** Within about 10 cm of a
     wall the direct sound and its echo off that wall overlap and interfere
     (status `fade`) in about one reading in five (one in two within 2 cm, one
-    in ten at 5 cm, one in forty at 10 cm); 30 cm from it, practically never.
+    in ten at 5 cm, one in twenty at 10 cm); 30 cm from it, practically never.
 
 ## 12. Code map and how to extend it
 
@@ -892,11 +896,12 @@ to `ENV_GROUPS` in `gui/panels.py` and it gets a control with a tooltip (a
 test fails until every `Environment` field has one). Give any new reading
 status a line in `STATUS` and a colour in both palettes in `theme.py`.
 
-**Tests.** 355 tests cover the physics against their formulas, the room
+**Tests.** 362 tests cover the physics against their formulas, the room
 geometry (seams, corners, the reflection search against a plain reference),
 the library's algorithms through the simulator, the simulator's algorithms,
 recording and replay of damaged files, the lab traces against the library,
-calibration, the maps, and every window driven headless. One test checks the
+calibration, the maps (in their own process, or on a thread where no process
+can start), and every window driven headless. One test checks the
 SHA-256 of the library files, so an accidental edit fails; the window tests
 work on temporary copies of config.toml and of the saved layout. The suite
 runs in about five minutes under Python 3.11 and 3.13.

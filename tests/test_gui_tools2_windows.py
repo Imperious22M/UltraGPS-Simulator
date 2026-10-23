@@ -383,10 +383,49 @@ class MapJobTest(unittest.TestCase):
 
     def test_without_child_processes_the_map_is_computed_here(self):
         spawn = type(multiprocessing.get_context("spawn"))
-        with mock.patch.object(spawn, "Process", side_effect=OSError("no processes here")):
-            seen = self.run_job(partial(maps.coverage, maps.scene(ideal_sim()), 40.0))
-        self.assertEqual((seen["failed"], len(seen["done"])), ([], 1))
+        fn    = partial(maps.coverage, maps.scene(ideal_sim()), 40.0)
+        with mock.patch.object(MapJob, "no_processes", False), \
+             mock.patch.object(spawn, "Process", side_effect=OSError("no processes here")) as start:
+            first  = self.run_job(fn)
+            second = self.run_job(fn)
+            self.assertTrue(MapJob.no_processes)
+        for seen in (first, second):
+            self.assertEqual((seen["failed"], len(seen["done"])), ([], 1))
+        self.assertEqual(start.call_count, 1)                     # the next map does not try again
 
+    def test_cancelling_stops_the_child(self):
+        job  = MapJob(partial(maps.accuracy, maps.scene(ideal_sim()), "CEP", 200, 10.0))
+        seen = []
+        job.failed.connect(seen.append)
+        job.start()
+        self.assertTrue(wait_for(lambda: job._conn is not None, 30))
+        job.cancel()
+        self.assertTrue(wait_for(job.isFinished, 20))
+        self.assertEqual(seen, ["cancelled"])
+
+
+class RunJobTest(unittest.TestCase):
+    """The child's side, run here on one end of a pipe."""
+
+    def test_the_child_stops_when_the_other_end_closes(self):
+        here, there = multiprocessing.Pipe()
+        here.close()                                              # as when the simulator is killed
+        maps.run_job(partial(maps.coverage, maps.scene(ideal_sim()), 40.0), there)
+        self.assertTrue(there.closed)
+
+    def test_progress_then_one_result(self):
+        here, there = multiprocessing.Pipe()
+        maps.run_job(partial(maps.coverage, maps.scene(ideal_sim()), 40.0), there)
+        sent = []
+        try:
+            while True:
+                sent.append(here.recv())
+        except EOFError:                                          # run_job closed its end
+            pass
+        kinds = [k for k, _ in sent]
+        self.assertEqual(kinds[-1], "done")
+        self.assertEqual(set(kinds[:-1]), {"progress"})
+        self.assertLessEqual(len(kinds), 102)                     # every 1 % at most
 
 if __name__ == "__main__":
     unittest.main()

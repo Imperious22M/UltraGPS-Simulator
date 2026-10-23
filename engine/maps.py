@@ -66,30 +66,38 @@ class Cancelled(Exception):
     """Raised inside a map computation once ``cancel()`` returns true."""
 
 
-def run_job(fn, events, stop) -> None:
+def run_job(fn, conn) -> None:
     """Child-process target: compute ``fn(progress=..., cancel=...)`` and send
     ``("progress", fraction)`` messages, then one ``("done", result)``,
-    ``("cancelled", None)`` or ``("failed", text)``, through the ``events``
-    queue.  Setting the ``stop`` event cancels within one ping."""
+    ``("cancelled", None)`` or ``("failed", text)``, through ``conn``, this
+    end of a two-way pipe.  Anything arriving from the other end cancels within
+    one ping, and so does that end closing, which it does if the simulator is
+    killed: the child then stops instead of computing for nobody."""
     sent = [0.0]
 
     def progress(fraction: float) -> None:
-        if fraction - sent[0] >= 0.002 or fraction >= 1.0:   # a message per point would flood the queue
+        if fraction - sent[0] >= 0.01 or fraction >= 1.0:    # a message per point would flood the window
             sent[0] = fraction
-            events.put(("progress", fraction))
+            conn.send(("progress", fraction))
 
     try:
-        events.put(("done", fn(progress=progress, cancel=stop.is_set)))
+        result = ("done", fn(progress=progress, cancel=conn.poll))
     except Cancelled:
-        events.put(("cancelled", None))
+        result = ("cancelled", None)
     except Exception as exc:
-        events.put(("failed", str(exc)))
+        result = ("failed", str(exc))
+    try:
+        conn.send(result)
+    except OSError:                   # nobody at the other end any more
+        pass
+    finally:
+        conn.close()
 
 
 @dataclass
 class Scene:
     """What the maps read from a simulation, copied so a map can be computed
-    on another thread while the simulation carries on."""
+    in another process or thread while the simulation carries on."""
     receivers: list
     world: World
     env: Environment

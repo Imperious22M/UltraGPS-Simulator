@@ -5,19 +5,20 @@ time an echo instead, how good the receivers' geometry is, how far off the
 ranges are, and how accurate each algorithm is (``engine.maps``).
 
 A map is computed in a child process from a copy of the simulation, so the
-simulation keeps running at full speed and so does the map (on a thread
-beside them it took several times as long).  It is drawn as coloured cells
-with a few contour lines under the walls, obstacles and receivers.  Hovering shows the value
-under the cursor.  "Show on arena" shades the main arena with it, with the
-same contour levels.  While a new map is computed, or after one failed or
-was cancelled, the previous map stays dimmed under a note saying so.
+simulation keeps running (a little slower) and the map takes about as long as
+with the simulation paused (on a thread beside them it took several times as
+long).  It is drawn as coloured cells with a few contour lines under the
+walls, obstacles and receivers.  Hovering shows the value under the cursor.
+"Show on arena" shades the main arena with it, with the same contour levels.
+While a new map is computed, or after one failed or was cancelled, the
+previous map stays dimmed under a note saying so.
 """
 
 from __future__ import annotations
 
 import math
 import multiprocessing
-import queue
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -212,17 +213,38 @@ def make_map(kind: MapKind, xs, ys, Z, n_receivers: int, title: str, detail: str
 class MapJob(QThread):
     """Runs ``fn(progress=..., cancel=...)`` in a child process
     (``maps.run_job``), relaying what it sends as signals.  Where no child
-    process can be started, ``fn`` runs on this thread instead."""
+    process can be started, ``fn`` runs on this thread instead, and so does
+    every later job."""
 
     progressed = pyqtSignal(float)
     computed   = pyqtSignal(object)        # (xs, ys, Z)
     failed     = pyqtSignal(str)
+
+    no_processes = False                   # set once a child process could not be started
 
     def __init__(self, fn, parent=None, process: bool = True):
         super().__init__(parent)
         self.fn        = fn
         self.cancelled = False
         self.process   = process
+        self._conn     = None              # this end of the pipe to the child, while one runs
+        self._lock     = threading.Lock()  # so cancel() never writes to a pipe being closed
+        self._stopping = False
+
+    def cancel(self) -> None:
+        """Stop within one ping; safe to call from any thread."""
+        with self._lock:
+            self.cancelled = True
+            self._stop_child()
+
+    def _stop_child(self) -> None:
+        """With the lock held: ask the child, if one runs, to stop (once)."""
+        if self._conn is not None and not self._stopping:
+            self._stopping = True
+            try:
+                self._conn.send("stop")
+            except OSError:               # it has already gone
+                pass
 
     def run(self) -> None:
         try:
@@ -235,24 +257,33 @@ class MapJob(QThread):
 
     def _in_child(self) -> bool:
         """Compute in a child process; false if none could be started."""
+        if MapJob.no_processes:
+            return False
         ctx = multiprocessing.get_context("spawn")      # a fork would copy the Qt threads' state
+        here = there = None
         try:
-            events, stop = ctx.Queue(), ctx.Event()
-            child = ctx.Process(target=maps.run_job, args=(self.fn, events, stop), daemon=True)
+            here, there = ctx.Pipe()
+            child = ctx.Process(target=maps.run_job, args=(self.fn, there), daemon=True)
             child.start()
         except Exception:             # no process support here (a sandbox, a frozen app)
+            MapJob.no_processes = True
+            for end in (here, there):
+                if end is not None:
+                    end.close()
             return False
+        there.close()                 # the child has its own: when it exits, this end reads EOF
         try:
+            with self._lock:
+                self._conn = here
+                if self.cancelled:        # cancelled while the child was starting
+                    self._stop_child()
             while True:
-                if self.cancelled:
-                    stop.set()
                 try:
-                    kind, value = events.get(timeout=0.05)
-                except queue.Empty:
-                    if not child.is_alive() and events.empty():
-                        self.failed.emit(f"failed: the map process stopped (exit code {child.exitcode})")
-                        return True
-                    continue
+                    kind, value = here.recv()
+                except (EOFError, OSError):   # it exited (or was killed) without a word
+                    child.join(5)
+                    self.failed.emit(f"failed: the map process stopped (exit code {child.exitcode})")
+                    return True
                 if kind == "progress":
                     self.progressed.emit(value)
                     continue
@@ -264,13 +295,13 @@ class MapJob(QThread):
                     self.failed.emit(f"failed: {value}")
                 return True
         finally:
-            stop.set()
+            with self._lock:
+                self._conn = None
+                here.close()          # tells the child to stop, if it has not
             child.join(5)
             if child.is_alive():
                 child.terminate()
                 child.join()
-            events.close()
-            events.join_thread()
 
 
 # ─── Canvas ──────────────────────────────────────────────────────────────────
@@ -700,7 +731,7 @@ class MapWindow(QMainWindow):
     def cancel(self) -> None:
         """Stop the computation within one ping (the next grid point)."""
         if self.job is not None:
-            self.job.cancelled = True
+            self.job.cancel()
 
     def show_on_arena(self) -> None:
         """Send the map shown to the main window's arena."""
@@ -744,7 +775,7 @@ class MapWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self.job is not None:
-            self.job.cancelled = True
+            self.job.cancel()
             self.job.wait(5000)
         super().closeEvent(event)
 

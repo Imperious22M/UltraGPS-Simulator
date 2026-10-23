@@ -50,14 +50,16 @@ python3 -m unittest discover -s tests -t .
 This repository does not modify or depend on any other repository at run time.
 These are copied in from
 [UltraGPS-Control](https://github.com/Imperious22M/UltraGPS-Control) at commit
-`f8f4f73`. The simulator never edits the two libraries (a test checks their
-SHA-256), but it does write config.toml: the calibration window saves offsets
-and calibration points to it, and so does `python3 -m engine.cal_points
---apply`:
+`f8f4f73`:
 
 - `ultragps_position/` — the positioning library (`libs/ultragps_position`)
 - `ultragps_calibration/` — the calibration library (`libs/ultragps_calibration`)
 - `config/config.toml` — receiver positions and calibration
+
+The simulator never edits the two libraries (a test checks their SHA-256), but
+it does write config.toml: the calibration window saves offsets and
+calibration points to it, and `python3 -m engine.cal_points --apply` writes
+the calibration points only (calibrate afterwards for new offsets).
 
 The copies differ from that commit as follows, from earlier work on this
 repository:

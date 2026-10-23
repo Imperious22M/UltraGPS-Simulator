@@ -525,8 +525,9 @@ STATES = ("on", "blocked", "off")
 RECEIVER_COLUMNS = (
     Column("on", "center", "oo", "On: working normally"),
     Column("blk", "center", "oo", "Blocked: something stands in the line of sight to the transmitter. "
-           "Sound can still reach it by bouncing off walls or bending round corners, so it may read "
-           "long or lose the signal"),
+           "Neither the direct sound nor sound bent round a corner reaches it, but a reflection off a "
+           "wall or obstacle (or, with Crosstalk on, another receiver's burst) still can, so it may "
+           "read long or short, or lose the signal"),
     Column("off", "center", "oo", "Off: unplugged, the base station reads 0 for it"),
     Column("tick", "right", "1510", "Tick count the base station printed: its sampling-loop count "
            "when the echo line dropped"),

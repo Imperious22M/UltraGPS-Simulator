@@ -2990,9 +2990,9 @@ class ScenarioPanel(QWidget):
             mode = QComboBox()
             for key, text in OVERRIDES.items():
                 mode.addItem(text, key)
-            mode.setToolTip(f"What happens to R{i}'s reading. Clean: as measured. Blocked: the direct sound is "
-                            "removed, so it hears a reflection, sound bent round a corner, or nothing (the "
-                            "HC-SR04 times out). +offset: the slider's cm added. Off: 0 ticks.")
+            mode.setToolTip(f"What happens to R{i}'s reading. Clean: as measured. Blocked: the direct sound and "
+                            "sound bent round a corner are removed, so it hears a reflection, another "
+                            "receiver's burst (with Crosstalk on), or nothing (the HC-SR04 times out). +offset: the slider's cm added. Off: 0 ticks.")
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, MAX_OFFSET_CM)
             slider.setEnabled(False)
