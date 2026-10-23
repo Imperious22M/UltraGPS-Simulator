@@ -584,5 +584,35 @@ class HatchTest(unittest.TestCase):
         self.assertTrue(any(img.pixel(x, 75) for x in range(200)))   # the page is inside the box: hatched
 
 
+class PaletteSwitchTest(unittest.TestCase):
+    def test_no_garbage_collection_runs_while_qt_walks_the_widgets(self):
+        # A collection deleting a closed window half way through Qt's walk crashed it
+        import gc
+        from PyQt6.QtCore import QObject
+        from PyQt6.QtWidgets import QLabel
+        app = QApplication.instance() or QApplication([])
+        seen = []
+
+        class Watch(QObject):
+            def eventFilter(self, obj, ev):
+                if ev.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange, QEvent.Type.FontChange):
+                    seen.append(gc.isenabled())
+                return False
+
+        label = QLabel("x")
+        label.show()
+        watch = Watch()
+        app.installEventFilter(watch)
+        try:
+            theme.apply(app, "paper")
+            theme.apply(app, "vector")
+        finally:
+            app.removeEventFilter(watch)
+            label.close()
+        self.assertTrue(seen)
+        self.assertNotIn(True, seen)
+        self.assertTrue(gc.isenabled())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ whole application.  ``apply(app, name)`` sets the Qt palette and style sheet.
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette
@@ -181,7 +182,6 @@ def apply(app, name: str = "vector") -> Palette:
     global current
     current = PALETTES[name]
     p = current
-    app.setStyle("Fusion")
     pal = QPalette()
     for role, c in ((QPalette.ColorRole.Window, p.panel), (QPalette.ColorRole.Base, p.panel),
                     (QPalette.ColorRole.AlternateBase, p.panel_alt), (QPalette.ColorRole.Text, p.text),
@@ -191,7 +191,19 @@ def apply(app, name: str = "vector") -> Palette:
                     (QPalette.ColorRole.ToolTipText, p.text), (QPalette.ColorRole.PlaceholderText, p.text_muted),
                     (QPalette.ColorRole.Link, p.accent), (QPalette.ColorRole.LinkVisited, p.accent)):
         pal.setColor(role, QColor(c))
-    app.setPalette(pal)
-    app.setFont(ui_font())
-    app.setStyleSheet(stylesheet(p))
+    # Each call below walks every widget, calling into Python on the way.  A
+    # garbage collection there can delete a closed window Qt is about to visit,
+    # and Qt then crashes: let it wait until the walk is over.
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        if app.property("ultragps_style") != "Fusion":     # once: each call makes a new style object
+            app.setStyle("Fusion")
+            app.setProperty("ultragps_style", "Fusion")
+        app.setPalette(pal)
+        app.setFont(ui_font())
+        app.setStyleSheet(stylesheet(p))
+    finally:
+        if collecting:
+            gc.enable()
     return p
