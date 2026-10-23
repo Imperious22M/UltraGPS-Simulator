@@ -208,6 +208,29 @@ class SimulatorTest(unittest.TestCase):
             self.assertAlmostEqual(off[i]["slope"], slope)
             self.assertAlmostEqual(off[i]["intercept"], d1 - slope * 300)
 
+    def test_field_of_view_drops_receivers_outside_15_degrees(self):
+        sim = Simulation(seed=0)
+        sim.faults = Faults(noise_cm=0.0, fov_enabled=True)
+        # R1 at (-127, 0) faces +x: (0, 0) is dead ahead, (0, 100) is ~38° off
+        ahead = run(sim, [0, 0], frames=1)
+        self.assertEqual(ahead["status"][1], "ok")
+        off = run(sim, [0, 100], frames=1)
+        self.assertEqual(off["status"][1], "angle")
+        self.assertEqual(off["ticks"][1], 0)
+        sim.faults.fov_enabled = False
+        self.assertEqual(run(sim, [0, 100], frames=1)["status"][1], "ok")
+
+    def test_near_receiver_noise(self):
+        sim = Simulation(seed=0)
+        sim.faults = Faults(noise_cm=0.0, near_noise_enabled=True)
+        errs = []
+        for _ in range(200):
+            f = run(sim, [-117, 0], frames=1)          # 10 cm from R1 (< 16 cm)
+            self.assertEqual(f["status"][1], "near")
+            errs.append(f["distances"][1] - 10.0)
+        self.assertGreater(np.std(errs), 3.0)
+        self.assertEqual(run(sim, [0, 0], frames=1)["status"][1], "ok")   # far: no extra noise
+
 
 if __name__ == "__main__":
     unittest.main()

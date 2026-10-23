@@ -7,33 +7,43 @@
 # values" window write to.  Both start from the real calibration in
 # UltraGPS-Control's config.toml.  Edit this file to model hardware that has
 # drifted from its calibration.
+#
+# facing_deg is the direction each receiver points (degrees, 0 = +x, 90 = +y),
+# used by the field-of-view option (±15° around it).  The default aims every
+# receiver at the centre of the arena; change it to match how they are mounted.
 
 [[receivers]]
 id = 0
 slope = 0.9630612464305284
 intercept = -139.44725418428027
+facing_deg = 55.81
 
 [[receivers]]
 id = 1
 slope = 0.9327247917290417
 intercept = -136.47768313753735
+facing_deg = 0.0
 
 [[receivers]]
 id = 2
 slope = 0.6983371717062204
 intercept = -51.34441018820081
+facing_deg = -55.81
 
 [[receivers]]
 id = 3
 slope = 0.8906825466597499
 intercept = -110.62034501725992
+facing_deg = 124.2
 
 [[receivers]]
 id = 4
 slope = 1.0376721067958428
 intercept = -183.0140237280535
+facing_deg = 180.0
 
 [[receivers]]
 id = 5
 slope = 0.9669404861629656
 intercept = -150.48487416479628
+facing_deg = -124.2

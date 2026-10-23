@@ -52,15 +52,18 @@ DEFAULT_SENSORS = os.path.join(_REPO, "config", "sensors.toml")
 ALGORITHMS     = ("OLS", "LM", "CEP", "CEP4")
 
 
-def load_sensors(config_path: str, sensors_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ``(coords, slopes, intercepts)`` in receiver-id order: positions
-    from config.toml, true tick response from sensors.toml."""
+def load_sensors(config_path: str, sensors_path: str) -> tuple[np.ndarray, ...]:
+    """Return ``(coords, slopes, intercepts, facing_deg)`` in receiver-id order:
+    positions from config.toml; true tick response and facing direction from
+    sensors.toml (``facing_deg`` is ``None`` if any receiver lacks one)."""
     receivers  = sorted(load_config(config_path)["receivers"], key=lambda r: r["id"])
     truth      = {int(r["id"]): r for r in load_config(sensors_path)["receivers"]}
     coords     = np.array([r["position"] for r in receivers], dtype=float)
     slopes     = np.array([truth[r["id"]]["slope"] for r in receivers], dtype=float)
     intercepts = np.array([truth[r["id"]]["intercept"] for r in receivers], dtype=float)
-    return coords, slopes, intercepts
+    facing     = [truth[r["id"]].get("facing_deg") for r in receivers]
+    facing     = None if None in facing else np.array(facing, dtype=float)
+    return coords, slopes, intercepts, facing
 
 
 class Solvers:

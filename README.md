@@ -77,6 +77,8 @@ these changes (`diff` against UltraGPS-Control shows them).
 | Top-band reject | The library filter drops any distance above this (default: widest receiver spacing) |
 | Timestep | Simulated seconds per frame, and the time between frames when running |
 | **Pause** / **Step** | Stop the run / advance exactly one frame (Step pauses first) |
+| **Field of view (±15°)** | Under the map. Each receiver only hears the transmitter within ±15° of the direction it faces (red dashed lines); outside, it drops out (0 ticks) |
+| **Near-receiver noise** | Under the map. Within 4% of the 400 cm range (16 cm) of a receiver, its reading gets extra noise (σ 5 cm) |
 | **Cal points: N** | Choose how many calibration points (2, 3 or 4) Search and Manual selection place |
 | **Search points** | Find the best N points with the search below, show them on the arena and save them |
 | **Manual selection** | Click N points on the arena instead (press again to cancel) |
@@ -208,7 +210,11 @@ unmodified calibration library beyond its first two points.
 
 `sensor_model.py` turns a true position into ticks: straight-line range,
 speed-of-sound scaling for temperature, Gaussian noise, then the faults above.
-Ranges beyond the HC-SR04's 400 cm read as 0 ticks. A lost signal reads as the
+Ranges beyond the HC-SR04's 400 cm read as 0 ticks. With **Field of view** on,
+a transmitter more than 15° off a receiver's facing direction (`facing_deg` in
+`sensors.toml`; by default every receiver aims at the arena centre) also reads
+as 0 ticks. With **Near-receiver noise** on, a receiver within 16 cm gets an
+extra 5 cm of noise. Both also apply during calibration. A lost signal reads as the
 distance sound travels in the HC-SR04's ~38 ms echo timeout (datasheet value;
 the real board's figure may differ). A bad value is the measured range scaled
 by a random factor within ±"Bad value range" %. Distances are converted to

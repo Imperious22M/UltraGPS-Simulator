@@ -25,6 +25,7 @@ from matplotlib.widgets import Button, CheckButtons, Slider, TextBox
 
 import cal_points
 from calibration import Calibrator, read_offsets
+from sensor_model import FOV_HALF_DEG
 from simulation import Simulation
 from solvers import ALGORITHMS, DEFAULT_CONFIG, DEFAULT_SENSORS
 
@@ -33,7 +34,9 @@ COLORS      = {"OLS": "tab:orange", "LM": "tab:blue", "CEP": "tab:green", "CEP4"
 LABELS      = {"OLS": "Linear LS (OLS)", "LM": "OLS + Levenberg-Marquardt", "CEP": "CEP best subset",
                "CEP4": "CEP, 4+ receivers, no box"}
 STATUS_FILL = {"ok": "tab:green", "off": "lightgray", "dropout": "tab:orange",
-               "range": "tab:orange", "timeout": "tab:brown", "spike": "tab:red"}
+               "range": "tab:orange", "angle": "lightsalmon", "timeout": "tab:brown",
+               "spike": "tab:red", "near": "gold"}
+FOV_COLOR   = "indianred"
 PATH_RADIUS = 100.0
 
 
@@ -117,7 +120,7 @@ class App:
 
     def _build_arena(self) -> None:
         c  = self.sim.coords
-        ax = self.ax = self.fig.add_axes([0.05, 0.13, 0.55, 0.82])
+        ax = self.ax = self.fig.add_axes([0.05, 0.17, 0.55, 0.79])
         ax.set_aspect("equal")
         ax.set_xlim(c[:, 0].min() - 60, c[:, 0].max() + 60)
         ax.set_ylim(c[:, 1].min() - 40, c[:, 1].max() + 40)
@@ -145,6 +148,26 @@ class App:
         self.target_m, = ax.plot([], [], "o", mfc="none", mec="gray", ms=14, label="Target")
         self.true_m,   = ax.plot([], [], "kx", ms=12, mew=2.5, label="True position", zorder=6)
         ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.07), ncol=3, fontsize=8)
+
+        # Field-of-view edges: dashed lines at facing ± FOV_HALF_DEG (shown when enabled)
+        reach = 1000.0
+        self.fov_lines = []
+        for (x, y), face in zip(c, self.sim.sensor.facing_deg):
+            for edge in (face - FOV_HALF_DEG, face + FOV_HALF_DEG):
+                a = np.radians(edge)
+                self.fov_lines += ax.plot([x, x + reach * np.cos(a)], [y, y + reach * np.sin(a)],
+                                          "--", color=FOV_COLOR, lw=1, alpha=0.7, visible=False)
+
+        # Sensor-physics options, in their own bordered box under the map
+        box = self.fig.add_axes([0.12, 0.008, 0.41, 0.05])
+        box.set_xticks([]), box.set_yticks([])
+        box.text(0.01, 0.5, "Sensor\nphysics", fontsize=8, va="center", weight="bold")
+        self.fov_cb  = CheckButtons(self.fig.add_axes([0.18, 0.013, 0.17, 0.04], frame_on=False),
+                                    [f"Field of view (±{FOV_HALF_DEG:.0f}°)"], [False])
+        self.near_cb = CheckButtons(self.fig.add_axes([0.36, 0.013, 0.16, 0.04], frame_on=False),
+                                    ["Near-receiver noise"], [False])
+        self.fov_cb.on_clicked(self._on_fov)
+        self.near_cb.on_clicked(self._on_near)
 
     def _build_controls(self) -> None:
         f, n = self.fig, len(self.sim.coords)
@@ -234,6 +257,16 @@ class App:
 
     def _on_tower(self, label) -> None:
         self.sim.enabled[int(label[1:])] ^= True
+
+    def _on_fov(self, _) -> None:
+        on = self.fov_cb.get_status()[0]
+        self.sim.faults.fov_enabled = on
+        for line in self.fov_lines:
+            line.set_visible(on)
+        self.fig.canvas.draw_idle()
+
+    def _on_near(self, _) -> None:
+        self.sim.faults.near_noise_enabled = self.near_cb.get_status()[0]
 
     def _on_algo(self, label) -> None:
         self.shown[label] = not self.shown[label]

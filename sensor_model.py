@@ -18,6 +18,10 @@ Physics, in order:
                                           i.e. about 13 m of travel
      * erroneous echo (multipath, EMI) -> the measured range off by a random
                                           amount within ±``spike_pct`` %
+     * outside the receiver's field of  -> 0 ticks, like a dropout (optional:
+       view (±15° around facing_deg)       ``Faults.fov_enabled``)
+     * very close to the receiver       -> extra Gaussian noise (optional:
+       (within 4% of its 400 cm range)     ``Faults.near_noise_enabled``)
 
   5. Inverse calibration: ``tick = (distance - intercept) / slope``, rounded to
      an integer, so the library's own ``tick * slope + intercept`` recovers the
@@ -32,6 +36,9 @@ import numpy as np
 
 
 ECHO_TIMEOUT_S = 0.038   # HC-SR04 echo timeout (datasheet: ~38 ms with no echo)
+FOV_HALF_DEG   = 15.0    # receiver hears the transmitter within ±15° of where it faces
+NEAR_FRACTION  = 0.04    # "very close": within 4% of the rated range (16 cm at 400 cm)
+NEAR_NOISE_CM  = 5.0     # extra noise std-dev when very close
 
 
 def speed_of_sound(temp_c: float) -> float:
@@ -47,6 +54,8 @@ class Faults:
     spike_rate: float = 0.0      # probability a reading is a wrong value
     spike_pct: float = 50.0      # wrong value = measured range ± up to this %
     temperature_c: float = 20.0  # air temperature during the run
+    fov_enabled: bool = False    # receivers only hear within ±FOV_HALF_DEG
+    near_noise_enabled: bool = False  # extra noise when very close to a receiver
 
 
 class SensorModel:
@@ -55,6 +64,7 @@ class SensorModel:
         receiver_coords: np.ndarray,
         slopes: np.ndarray,
         intercepts: np.ndarray,
+        facing_deg: np.ndarray | None = None,
         max_range_cm: float = 400.0,   # HC-SR04 rated range
         cal_temp_c: float = 20.0,
         seed: int | None = None,
@@ -62,6 +72,10 @@ class SensorModel:
         self.coords     = np.asarray(receiver_coords, dtype=float)
         self.slopes     = np.asarray(slopes, dtype=float)
         self.intercepts = np.asarray(intercepts, dtype=float)
+        if facing_deg is None:   # aim every receiver at the centre of the arena
+            to_centre  = (self.coords.min(axis=0) + self.coords.max(axis=0)) / 2 - self.coords
+            facing_deg = np.degrees(np.arctan2(to_centre[:, 1], to_centre[:, 0]))
+        self.facing_deg = np.asarray(facing_deg, dtype=float)
         self.max_range  = max_range_cm
         self.cal_temp_c = cal_temp_c
         self.rng        = np.random.default_rng(seed)
@@ -69,14 +83,24 @@ class SensorModel:
     def true_distances(self, pos) -> np.ndarray:
         return np.linalg.norm(self.coords - np.asarray(pos, dtype=float), axis=1)
 
+    def in_fov(self, pos) -> np.ndarray:
+        """Per receiver: is ``pos`` within ±FOV_HALF_DEG of where it faces?"""
+        d     = np.asarray(pos, dtype=float) - self.coords
+        angle = np.degrees(np.arctan2(d[:, 1], d[:, 0]))
+        off   = (angle - self.facing_deg + 180.0) % 360.0 - 180.0
+        return np.abs(off) <= FOV_HALF_DEG
+
     def measure(self, pos, enabled, faults: Faults) -> tuple[list[int], list[str]]:
         """Return ``(ticks, status)`` — one tick count and one status label
-        (``ok``, ``off``, ``dropout``, ``range``, ``timeout``, ``spike``) per
-        receiver."""
+        (``ok``, ``off``, ``range``, ``angle``, ``dropout``, ``timeout``,
+        ``spike``, ``near``) per receiver."""
         n     = len(self.coords)
         scale = speed_of_sound(self.cal_temp_c) / speed_of_sound(faults.temperature_c)
         true  = self.true_distances(pos)
         dist  = true * scale + self.rng.normal(0.0, faults.noise_cm, n)
+
+        in_fov = self.in_fov(pos)
+        near   = true < NEAR_FRACTION * self.max_range
 
         status = ["ok"] * n
         for i in range(n):
@@ -84,6 +108,8 @@ class SensorModel:
                 status[i] = "off"
             elif true[i] > self.max_range:
                 status[i] = "range"
+            elif faults.fov_enabled and not in_fov[i]:
+                status[i] = "angle"
             elif self.rng.random() < faults.dropout_rate:
                 status[i] = "dropout"
             elif self.rng.random() < faults.timeout_rate:
@@ -93,10 +119,13 @@ class SensorModel:
                 p = faults.spike_pct / 100.0
                 dist[i] *= 1.0 + self.rng.uniform(-p, p)
                 status[i] = "spike"
+            elif faults.near_noise_enabled and near[i]:
+                dist[i] += self.rng.normal(0.0, NEAR_NOISE_CM)
+                status[i] = "near"
 
         ticks = []
         for i in range(n):
-            if status[i] in ("off", "range", "dropout"):
+            if status[i] in ("off", "range", "angle", "dropout"):
                 ticks.append(0)
             else:
                 ticks.append(max(0, round((dist[i] - self.intercepts[i]) / self.slopes[i])))

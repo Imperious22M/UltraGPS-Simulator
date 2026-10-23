@@ -28,8 +28,8 @@ class Simulation:
     ):
         # The sensors use the simulated hardware's true response; the solvers
         # use the calibration in config_path, which may differ from it.
-        coords, slopes, intercepts = load_sensors(config_path, sensors_path)
-        self.sensor  = SensorModel(coords, slopes, intercepts, seed=seed)
+        coords, slopes, intercepts, facing = load_sensors(config_path, sensors_path)
+        self.sensor  = SensorModel(coords, slopes, intercepts, facing, seed=seed)
         self.solvers = Solvers(config_path, max_differential, max_distance)
         self.coords  = coords
         self.faults  = Faults()
